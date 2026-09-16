@@ -3973,6 +3973,37 @@ VHACD::BoundsAABB AABBTree::CalculateFaceBounds(uint32_t* faces,
                              maxExtents);
 }
 
+enum class Stages
+{
+    COMPUTE_BOUNDS_OF_INPUT_MESH,
+    CREATE_RAYCAST_MESH,
+    VOXELIZING_INPUT_MESH,
+    BUILD_INITIAL_CONVEX_HULL,
+    PERFORMING_DECOMPOSITION,
+    INITIALIZING_CONVEX_HULLS_FOR_MERGING,
+    COMPUTING_COST_MATRIX,
+    MERGING_CONVEX_HULLS,
+    FINALIZING_RESULTS,
+    NUM_STAGES
+};
+
+class VHACDCallbacks
+{
+public:
+    virtual void ProgressUpdate(Stages stage,
+                                double stageProgress,
+                                const char *operation) = 0;
+    // Reports progress when the last report is older than the progress interval, so a caller that
+    // checks for cancellation inside IUserCallback::Update notices it within a bounded time.
+    // Long loops call this once per bounded unit of work. Returns true once Cancel was requested.
+    virtual bool PollProgress(Stages stage,
+                              double stageProgress,
+                              const char *operation) = 0;
+    virtual bool IsCanceled() const = 0;
+
+    virtual ~VHACDCallbacks() = default;
+};
+
 enum class VoxelValue : uint8_t
 {
     PRIMITIVE_UNDEFINED = 0,
@@ -3985,13 +4016,16 @@ enum class VoxelValue : uint8_t
 class Volume
 {
 public:
+    // Returns early with a partial volume once callbacks report cancellation.
     void Voxelize(const std::vector<VHACD::Vertex>& points,
                   const std::vector<VHACD::Triangle>& triangles,
                   const size_t dim,
                   FillMode fillMode,
-                  const AABBTree& aabbTree);
+                  const AABBTree& aabbTree,
+                  VHACDCallbacks& callbacks);
 
-    void RaycastFill(const AABBTree& aabbTree);
+    void RaycastFill(const AABBTree& aabbTree,
+                     VHACDCallbacks& callbacks);
 
     void SetVoxel(const size_t i,
                   const size_t j,
@@ -4022,9 +4056,9 @@ private:
                             const size_t i1,
                             const size_t j1,
                             const size_t k1);
-    void FillOutsideSurface();
+    void FillOutsideSurface(VHACDCallbacks& callbacks);
 
-    void FillInsideSurface();
+    void FillInsideSurface(VHACDCallbacks& callbacks);
 
     std::vector<VHACD::Voxel> m_surfaceVoxels;
     std::vector<VHACD::Voxel> m_interiorVoxels;
@@ -4181,7 +4215,8 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                       const std::vector<VHACD::Triangle>& indices,
                       const size_t dimensions,
                       FillMode fillMode,
-                      const AABBTree& aabbTree)
+                      const AABBTree& aabbTree,
+                      VHACDCallbacks& callbacks)
 {
     const size_t dim = VoxelDimensionForResolution(dimensions);
     assert(dim <= MaxVoxelDimension);
@@ -4232,6 +4267,10 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
     const VHACD::Vect3 boxhalfsize(double(0.5));
     for (size_t t = 0; t < indices.size(); ++t)
     {
+        if ( (t & 1023) == 0 && callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, 50.0 * double(t) / double(indices.size()), "Voxelizing triangles") )
+        {
+            return;
+        }
         size_t i0, j0, k0;
         size_t i1, j1, k1;
         VHACD::Vector3<uint32_t> tri = indices[t];
@@ -4342,16 +4381,17 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
         MarkOutsideSurface(0,            m_dim[1] - 1, 0,            m_dim[0], m_dim[1], m_dim[2]);
         MarkOutsideSurface(0,            0,            0,            1,        m_dim[1], m_dim[2]);
         MarkOutsideSurface(m_dim[0] - 1, 0,            0,            m_dim[0], m_dim[1], m_dim[2]);
-        FillOutsideSurface();
-        FillInsideSurface();
+        FillOutsideSurface(callbacks);
+        FillInsideSurface(callbacks);
     }
     else if (fillMode == FillMode::RAYCAST_FILL)
     {
-        RaycastFill(aabbTree);
+        RaycastFill(aabbTree, callbacks);
     }
 }
 
-void Volume::RaycastFill(const AABBTree& aabbTree)
+void Volume::RaycastFill(const AABBTree& aabbTree,
+                         VHACDCallbacks& callbacks)
 {
     const uint32_t i0 = m_dim[0];
     const uint32_t j0 = m_dim[1];
@@ -4364,6 +4404,10 @@ void Volume::RaycastFill(const AABBTree& aabbTree)
     uint32_t count{ 0 };
     for (uint32_t i = 0; i < i0; ++i)
     {
+        if ( callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, 50.0 + 50.0 * double(i) / double(i0), "Raycast fill") )
+        {
+            return;
+        }
         for (uint32_t j = 0; j < j0; ++j)
         {
             for (uint32_t k = 0; k < k0; ++k)
@@ -4522,7 +4566,7 @@ inline void WalkBackward(int64_t start,
     }
 }
 
-void Volume::FillOutsideSurface()
+void Volume::FillOutsideSurface(VHACDCallbacks& callbacks)
 {
     size_t voxelsWalked = 0;
     const int64_t i0 = m_dim[0];
@@ -4552,6 +4596,10 @@ void Volume::FillOutsideSurface()
         voxelsWalked = 0;
         for (int64_t i = 0; i < i0; ++i)
         {
+            if ( callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, 50.0 + 25.0 * double(i) / double(i0), "Flood filling outside") )
+            {
+                return;
+            }
             for (int64_t j = 0; j < j0; ++j)
             {
                 for (int64_t k = 0; k < k0; ++k)
@@ -4581,7 +4629,7 @@ void Volume::FillOutsideSurface()
     } while (voxelsWalked != 0);
 }
 
-void Volume::FillInsideSurface()
+void Volume::FillInsideSurface(VHACDCallbacks& callbacks)
 {
     const uint32_t i0 = uint32_t(m_dim[0]);
     const uint32_t j0 = uint32_t(m_dim[1]);
@@ -4595,6 +4643,10 @@ void Volume::FillInsideSurface()
 
     for (uint32_t i = 0; i < i0; ++i)
     {
+        if ( callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, 75.0 + 25.0 * double(i) / double(i0), "Filling inside") )
+        {
+            return;
+        }
         for (uint32_t j = 0; j < j0; ++j)
         {
             for (uint32_t k = 0; k < k0; ++k)
@@ -4735,31 +4787,6 @@ void ShrinkWrap(SimpleMesh& sourceConvexHull,
         sourceConvexHull.m_indices = qh.GetIndices();
     }
 }
-
-enum class Stages
-{
-    COMPUTE_BOUNDS_OF_INPUT_MESH,
-    CREATE_RAYCAST_MESH,
-    VOXELIZING_INPUT_MESH,
-    BUILD_INITIAL_CONVEX_HULL,
-    PERFORMING_DECOMPOSITION,
-    INITIALIZING_CONVEX_HULLS_FOR_MERGING,
-    COMPUTING_COST_MATRIX,
-    MERGING_CONVEX_HULLS,
-    FINALIZING_RESULTS,
-    NUM_STAGES
-};
-
-class VHACDCallbacks
-{
-public:
-    virtual void ProgressUpdate(Stages stage,
-                                double stageProgress,
-                                const char *operation) = 0;
-    virtual bool IsCanceled() const = 0;
-
-    virtual ~VHACDCallbacks() = default;
-};
 
 enum class SplitAxis
 {
@@ -5376,9 +5403,14 @@ public:
                         double stageProgress,
                         const char* operation) override final;
 
+    bool PollProgress(Stages stage,
+                      double stageProgress,
+                      const char* operation) override final;
+
     bool IsCanceled() const override final;
 
     std::atomic<bool>                                   m_canceled{ false };
+    Timer                                               m_progressTimer; // Time since the last IUserCallback::Update
     Parameters                                          m_params; // Convex decomposition parameters
 
     std::vector<std::unique_ptr<IVHACD::ConvexHull>>    m_convexHulls; // Finalized convex hulls
@@ -5557,6 +5589,7 @@ IVHACD::ComputeResult VHACDImpl::Compute(const std::vector<VHACD::Vertex>& point
 {
     m_params = params;
     m_canceled = false;
+    m_progressTimer.Reset();
 
     CopyInputMesh(points,
                   triangles);
@@ -5626,6 +5659,10 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
 
         for (uint32_t i = 0; i < triangles.size() && !m_canceled; ++i)
         {
+            if ( (i & 1023) == 0 && PollProgress(Stages::COMPUTE_BOUNDS_OF_INPUT_MESH, 100.0 * double(i) / double(triangles.size()), "Reindexing input mesh") )
+            {
+                break;
+            }
             const VHACD::Triangle& t = triangles[i];
             const VHACD::Vertex& p1 = points[t.mI0];
             const VHACD::Vertex& p2 = points[t.mI1];
@@ -5682,7 +5719,8 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                             m_indices,
                             m_params.m_resolution,
                             m_params.m_fillMode,
-                            m_AABBTree);
+                            m_AABBTree,
+                            *this);
         m_voxelScale = m_voxelize.GetScale();
         ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
                        100,
@@ -5740,25 +5778,18 @@ void VHACDImpl::PerformConvexDecomposition()
         double maxHulls = pow(2, m_params.m_maxRecursionDepth);
         // We recursively split convex hulls until we can
         // no longer recurse further.
-        Timer t;
-
         while ( !m_pendingHulls.empty() && !m_canceled )
         {
             size_t count = m_pendingHulls.size() + m_voxelHulls.size();
-            double e = t.PeekElapsedSeconds();
-            if ( e >= double(0.1) )
-            {
-                t.Reset();
-                double stageProgress = (double(count) * double(100.0)) / maxHulls;
-                ProgressUpdate(Stages::PERFORMING_DECOMPOSITION,
-                               stageProgress,
-                               "Performing recursive decomposition of convex hulls");
-            }
             // First we make a copy of the hulls we are processing
             std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
             // Split every hull on this level that is not yet complete
             for (auto& i : oldList)
             {
+                if ( PollProgress(Stages::PERFORMING_DECOMPOSITION, (double(count) * double(100.0)) / maxHulls, "Performing recursive decomposition of convex hulls") )
+                {
+                    return;
+                }
                 if ( !i->IsComplete() && count <= MaxConvexHullFragments )
                 {
                     i->PerformPlaneSplit();
@@ -5864,6 +5895,10 @@ void VHACDImpl::PerformConvexDecomposition()
             {
                 for (CostTask& task : tasks)
                 {
+                    if ( PollProgress(Stages::COMPUTING_COST_MATRIX, 100.0 * double(&task - tasks.data()) / double(tasks.size()), "Computing Hull Merge Cost Matrix") )
+                    {
+                        return;
+                    }
                     PerformMergeCostTask(task);
                     AddCostToPriorityQueue(task);
                 }
@@ -5876,27 +5911,19 @@ void VHACDImpl::PerformConvexDecomposition()
             {
                 ScopedTime stMerging("Merging Convex Hulls",
                                      m_params.m_logger);
-                Timer t;
                 // Now that we know the cost to merge each hull, we can begin merging them.
-                bool cancel = false;
 
                 uint32_t maxMergeCount = uint32_t(m_liveHullCount) - m_params.m_maxConvexHulls;
                 uint32_t startCount = uint32_t(m_liveHullCount);
 
-                while (    !cancel
-                        && m_liveHullCount > m_params.m_maxConvexHulls
+                while (    m_liveHullCount > m_params.m_maxConvexHulls
                         && !m_hullPairQueue.empty()
                         && !m_canceled)
                 {
-                    double e = t.PeekElapsedSeconds();
-                    if ( e >= double(0.1) )
+                    const uint32_t hullsProcessed = startCount - uint32_t(m_liveHullCount);
+                    if ( PollProgress(Stages::MERGING_CONVEX_HULLS, double(hullsProcessed) * 100.0 / double(maxMergeCount), "Merging Convex Hulls") )
                     {
-                        t.Reset();
-                        uint32_t hullsProcessed = startCount - uint32_t(m_liveHullCount);
-                        double stageProgress = double(hullsProcessed * 100) / double(maxMergeCount);
-                        ProgressUpdate(Stages::MERGING_CONVEX_HULLS,
-                                       stageProgress,
-                                       "Merging Convex Hulls");
+                        return;
                     }
 
                     HullPair hp = m_hullPairQueue.top();
@@ -5975,9 +6002,9 @@ void VHACDImpl::PerformConvexDecomposition()
                            "Finalizing results");
             for (std::unique_ptr<ConvexHull>& hull : m_hulls)
             {
-                if ( m_canceled )
+                if ( PollProgress(Stages::FINALIZING_RESULTS, 100.0 * double(&hull - m_hulls.data()) / double(m_hulls.size()), "Finalizing results") )
                 {
-                    break;
+                    return;
                 }
                 if ( !hull )
                 {
@@ -6228,6 +6255,7 @@ void VHACDImpl::ProgressUpdate(Stages stage,
                                double stageProgress,
                                const char* operation)
 {
+    m_progressTimer.Reset();
     if ( m_params.m_callback )
     {
         double overallProgress = (double(stage) * 100) / double(Stages::NUM_STAGES);
@@ -6237,6 +6265,20 @@ void VHACDImpl::ProgressUpdate(Stages stage,
                                     s,
                                     operation);
     }
+}
+
+bool VHACDImpl::PollProgress(Stages stage,
+                             double stageProgress,
+                             const char* operation)
+{
+    // 10 ms bounds how stale a cancellation request can be before a caller observing it in Update
+    // sees it, beyond the longest single unit of work between polls.
+    static constexpr double ProgressIntervalSeconds = 0.01;
+    if ( m_progressTimer.PeekElapsedSeconds() >= ProgressIntervalSeconds )
+    {
+        ProgressUpdate(stage, stageProgress, operation);
+    }
+    return m_canceled;
 }
 
 bool VHACDImpl::IsCanceled() const
