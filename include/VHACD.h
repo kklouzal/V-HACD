@@ -1210,9 +1210,8 @@ double ComputeMeshVolume(const std::vector<VHACD::Vertex>& vertices,
 
 /*
  * To minimize memory allocations while maintaining pointer stability.
- * Used in KdTreeNode and ConvexHull, as both use tree data structures that rely on pointer stability
- * Neither rely on random access or iteration
- * They just dump elements into a memory pool, then refer to pointers to the elements
+ * Used by the ConvexHull AABB tree, whose nodes refer to each other by pointer.
+ * It does not support random access or iteration: elements are placed in the pool and referenced by pointer.
  * All elements are default constructed in NodeStorage's m_nodes array
  */
 template <typename T, std::size_t MaxBundleSize = 1024>
@@ -2787,393 +2786,6 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 //***********************************************************************************************
 // End of ConvexHull generation code by Julio Jerez <jerezjulio0@gmail.com>
 //***********************************************************************************************
-
-class KdTreeNode;
-
-enum Axes
-{
-    X_AXIS = 0,
-    Y_AXIS = 1,
-    Z_AXIS = 2
-};
-
-class KdTreeFindNode
-{
-public:
-    KdTreeFindNode() = default;
-
-    KdTreeNode* m_node{ nullptr };
-    double m_distance{ 0.0 };
-};
-
-class KdTree
-{
-public:
-    KdTree() = default;
-
-    const VHACD::Vertex& GetPosition(uint32_t index) const;
-
-    uint32_t Search(const VHACD::Vect3& pos,
-                    double radius,
-                    uint32_t maxObjects,
-                    KdTreeFindNode* found) const;
-
-    uint32_t Add(const VHACD::Vertex& v);
-
-    KdTreeNode& GetNewNode(uint32_t index);
-
-    uint32_t GetNearest(const VHACD::Vect3& pos,
-                        double radius,
-                        bool& _found) const; // returns the nearest possible neighbor's index.
-
-    std::vector<VHACD::Vertex>&& TakeVertices();
-
-
-private:
-    KdTreeNode* m_root{ nullptr };
-    NodeBundle<KdTreeNode> m_bundle;
-
-    std::vector<VHACD::Vertex> m_vertices;
-};
-
-class KdTreeNode
-{
-public:
-    KdTreeNode() = default;
-    KdTreeNode(uint32_t index);
-
-    void Add(KdTreeNode& node,
-             Axes dim,
-             const KdTree& iface);
-
-    uint32_t GetIndex() const;
-
-    void Search(Axes axis,
-                const VHACD::Vect3& pos,
-                double radius,
-                uint32_t& count,
-                uint32_t maxObjects,
-                KdTreeFindNode* found,
-                const KdTree& iface);
-
-private:
-    uint32_t m_index = 0;
-    KdTreeNode* m_left = nullptr;
-    KdTreeNode* m_right = nullptr;
-};
-
-const VHACD::Vertex& KdTree::GetPosition(uint32_t index) const
-{
-    assert(index < m_vertices.size());
-    return m_vertices[index];
-}
-
-uint32_t KdTree::Search(const VHACD::Vect3& pos,
-                        double radius,
-                        uint32_t maxObjects,
-                        KdTreeFindNode* found) const
-{
-    if (!m_root)
-        return 0;
-    uint32_t count = 0;
-    m_root->Search(X_AXIS, pos, radius, count, maxObjects, found, *this);
-    return count;
-}
-
-uint32_t KdTree::Add(const VHACD::Vertex& v)
-{
-    uint32_t ret = uint32_t(m_vertices.size());
-    m_vertices.emplace_back(v);
-    KdTreeNode& node = GetNewNode(ret);
-    if (m_root)
-    {
-        m_root->Add(node,
-                    X_AXIS,
-                    *this);
-    }
-    else
-    {
-        m_root = &node;
-    }
-    return ret;
-}
-
-KdTreeNode& KdTree::GetNewNode(uint32_t index)
-{
-    KdTreeNode& node = m_bundle.GetNextNode();
-    node = KdTreeNode(index);
-    return node;
-}
-
-uint32_t KdTree::GetNearest(const VHACD::Vect3& pos,
-                            double radius,
-                            bool& _found) const // returns the nearest possible neighbor's index.
-{
-    uint32_t ret = 0;
-
-    _found = false;
-    KdTreeFindNode found;
-    uint32_t count = Search(pos, radius, 1, &found);
-    if (count)
-    {
-        KdTreeNode* node = found.m_node;
-        ret = node->GetIndex();
-        _found = true;
-    }
-    return ret;
-}
-
-std::vector<VHACD::Vertex>&& KdTree::TakeVertices()
-{
-    return std::move(m_vertices);
-}
-
-KdTreeNode::KdTreeNode(uint32_t index)
-    : m_index(index)
-{
-}
-
-void KdTreeNode::Add(KdTreeNode& node,
-                     Axes dim,
-                     const KdTree& tree)
-{
-    Axes axis = X_AXIS;
-    uint32_t idx = 0;
-    switch (dim)
-    {
-    case X_AXIS:
-        idx = 0;
-        axis = Y_AXIS;
-        break;
-    case Y_AXIS:
-        idx = 1;
-        axis = Z_AXIS;
-        break;
-    case Z_AXIS:
-        idx = 2;
-        axis = X_AXIS;
-        break;
-    }
-
-    const VHACD::Vertex& nodePosition = tree.GetPosition(node.m_index);
-    const VHACD::Vertex& position = tree.GetPosition(m_index);
-    if (nodePosition[idx] <= position[idx])
-    {
-        if (m_left)
-            m_left->Add(node, axis, tree);
-        else
-            m_left = &node;
-    }
-    else
-    {
-        if (m_right)
-            m_right->Add(node, axis, tree);
-        else
-            m_right = &node;
-    }
-}
-
-uint32_t KdTreeNode::GetIndex() const
-{
-    return m_index;
-}
-
-void KdTreeNode::Search(Axes axis,
-                        const VHACD::Vect3& pos,
-                        double radius,
-                        uint32_t& count,
-                        uint32_t maxObjects,
-                        KdTreeFindNode* found,
-                        const KdTree& iface)
-{
-    const VHACD::Vect3 position = iface.GetPosition(m_index);
-
-    const VHACD::Vect3 d = pos - position;
-
-    KdTreeNode* search1 = 0;
-    KdTreeNode* search2 = 0;
-
-    uint32_t idx = 0;
-    switch (axis)
-    {
-    case X_AXIS:
-        idx = 0;
-        axis = Y_AXIS;
-        break;
-    case Y_AXIS:
-        idx = 1;
-        axis = Z_AXIS;
-        break;
-    case Z_AXIS:
-        idx = 2;
-        axis = X_AXIS;
-        break;
-    }
-
-    if (d[idx] <= 0) // JWR  if we are to the left
-    {
-        search1 = m_left; // JWR  then search to the left
-        if (-d[idx] < radius) // JWR  if distance to the right is less than our search radius, continue on the right
-                            // as well.
-            search2 = m_right;
-    }
-    else
-    {
-        search1 = m_right; // JWR  ok, we go down the left tree
-        if (d[idx] < radius) // JWR  if the distance from the right is less than our search radius
-            search2 = m_left;
-    }
-
-    double r2 = radius * radius;
-    double m = d.GetNormSquared();
-
-    if (m < r2)
-    {
-        switch (count)
-        {
-        case 0:
-        {
-            found[count].m_node = this;
-            found[count].m_distance = m;
-            break;
-        }
-        case 1:
-        {
-            if (m < found[0].m_distance)
-            {
-                if (maxObjects == 1)
-                {
-                    found[0].m_node = this;
-                    found[0].m_distance = m;
-                }
-                else
-                {
-                    found[1] = found[0];
-                    found[0].m_node = this;
-                    found[0].m_distance = m;
-                }
-            }
-            else if (maxObjects > 1)
-            {
-                found[1].m_node = this;
-                found[1].m_distance = m;
-            }
-            break;
-        }
-        default:
-        {
-            bool inserted = false;
-
-            for (uint32_t i = 0; i < count; i++)
-            {
-                if (m < found[i].m_distance) // if this one is closer than a pre-existing one...
-                {
-                    // insertion sort...
-                    uint32_t scan = count;
-                    if (scan >= maxObjects)
-                        scan = maxObjects - 1;
-                    for (uint32_t j = scan; j > i; j--)
-                    {
-                        found[j] = found[j - 1];
-                    }
-                    found[i].m_node = this;
-                    found[i].m_distance = m;
-                    inserted = true;
-                    break;
-                }
-            }
-
-            if (!inserted && count < maxObjects)
-            {
-                found[count].m_node = this;
-                found[count].m_distance = m;
-            }
-        }
-        break;
-        }
-
-        count++;
-
-        if (count > maxObjects)
-        {
-            count = maxObjects;
-        }
-    }
-
-
-    if (search1)
-        search1->Search(axis, pos, radius, count, maxObjects, found, iface);
-
-    if (search2)
-        search2->Search(axis, pos, radius, count, maxObjects, found, iface);
-}
-
-class VertexIndex
-{
-public:
-    VertexIndex(double granularity,
-                bool snapToGrid);
-
-    VHACD::Vect3 SnapToGrid(VHACD::Vect3 p);
-
-    uint32_t GetIndex(VHACD::Vect3 p,
-                      bool& newPos);
-
-
-    std::vector<VHACD::Vertex>&& TakeVertices();
-
-
-
-private:
-    bool m_snapToGrid : 1;
-    double m_granularity;
-    KdTree m_KdTree;
-};
-
-VertexIndex::VertexIndex(double granularity,
-                         bool snapToGrid)
-    : m_snapToGrid(snapToGrid)
-    , m_granularity(granularity)
-{
-}
-
-VHACD::Vect3 VertexIndex::SnapToGrid(VHACD::Vect3 p)
-{
-    for (int i = 0; i < 3; ++i)
-    {
-        double m = fmod(p[i], m_granularity);
-        p[i] -= m;
-    }
-    return p;
-}
-
-uint32_t VertexIndex::GetIndex(VHACD::Vect3 p,
-                               bool& newPos)
-{
-    uint32_t ret;
-
-    newPos = false;
-
-    if (m_snapToGrid)
-    {
-        p = SnapToGrid(p);
-    }
-
-    bool found;
-    ret = m_KdTree.GetNearest(p, m_granularity, found);
-    if (!found)
-    {
-        newPos = true;
-        ret = m_KdTree.Add(VHACD::Vertex(p.GetX(), p.GetY(), p.GetZ()));
-    }
-
-    return ret;
-}
-
-std::vector<VHACD::Vertex>&& VertexIndex::TakeVertices()
-{
-    return std::move(m_KdTree.TakeVertices());
-}
 
 /*
  * A wrapper class for 3 10 bit integers packed into a 32 bit integer
@@ -5340,10 +4952,6 @@ public:
                           const std::vector<VHACD::Triangle>& triangles,
                           const Parameters& params);
 
-    // Take the source position, normalize it, and then convert it into an index position
-    uint32_t GetIndex(VHACD::VertexIndex& vi,
-                      const VHACD::Vertex& p);
-
     // This copies the input mesh while scaling the input positions
     // to fit into a normalized unit cube. It also re-indexes all of the
     // vertex positions in case they weren't clean coming in.
@@ -5611,16 +5219,6 @@ IVHACD::ComputeResult VHACDImpl::Compute(const std::vector<VHACD::Vertex>& point
     return ComputeResult::Completed;
 }
 
-uint32_t VHACDImpl::GetIndex(VHACD::VertexIndex& vi,
-                             const VHACD::Vertex& p)
-{
-    VHACD::Vect3 pos = (VHACD::Vect3(p) - m_center) * m_recipScale;
-    bool newPos;
-    uint32_t ret = vi.GetIndex(pos,
-                               newPos);
-    return ret;
-}
-
 void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                               const std::vector<VHACD::Triangle>& triangles)
 {
@@ -5653,24 +5251,64 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
     m_recipScale = m_scale > double(0.0) ? double(1.0) / m_scale : double(0.0);
 
     {
-        VHACD::VertexIndex vi = VHACD::VertexIndex(double(0.001), false);
+        // Only equal normalized positions are welded. A fuzzy weld deletes real geometry: upstream
+        // welded within 0.1% of the model extent, which collapsed the 18 cm lamps of a 270 m airfield
+        // into degenerate triangles that produced no voxels at all.
+        struct PositionKey
+        {
+            uint64_t x;
+            uint64_t y;
+            uint64_t z;
+
+            bool operator==(const PositionKey& other) const
+            {
+                return x == other.x && y == other.y && z == other.z;
+            }
+        };
+        struct PositionKeyHash
+        {
+            size_t operator()(const PositionKey& key) const
+            {
+                uint64_t h = key.x * 0x9E3779B97F4A7C15ull;
+                h = (h ^ (h >> 31)) + key.y * 0xC2B2AE3D27D4EB4Full;
+                h = (h ^ (h >> 29)) + key.z * 0x165667B19E3779F9ull;
+                return size_t(h ^ (h >> 32));
+            }
+        };
+        const auto coordinateBits = [](const double value) {
+            // Adding +0.0 turns -0.0 into +0.0, so equal coordinates share one key.
+            const double canonical = value + 0.0;
+            uint64_t bits;
+            memcpy(&bits, &canonical, sizeof(bits));
+            return bits;
+        };
+
+        std::unordered_map<PositionKey, uint32_t, PositionKeyHash> vertexIndex;
+        vertexIndex.reserve(points.size());
+        m_vertices.reserve(points.size());
+        const auto indexOf = [&](const VHACD::Vertex& p) {
+            const VHACD::Vect3 pos = (VHACD::Vect3(p) - m_center) * m_recipScale;
+            const PositionKey key{ coordinateBits(pos.GetX()), coordinateBits(pos.GetY()), coordinateBits(pos.GetZ()) };
+            const auto inserted = vertexIndex.emplace(key, uint32_t(m_vertices.size()));
+            if ( inserted.second )
+            {
+                m_vertices.emplace_back(pos.GetX(), pos.GetY(), pos.GetZ());
+            }
+            return inserted.first->second;
+        };
 
         uint32_t dcount = 0;
 
-        for (uint32_t i = 0; i < triangles.size() && !m_canceled; ++i)
+        for (size_t i = 0; i < triangles.size(); ++i)
         {
             if ( (i & 1023) == 0 && PollProgress(Stages::COMPUTE_BOUNDS_OF_INPUT_MESH, 100.0 * double(i) / double(triangles.size()), "Reindexing input mesh") )
             {
                 break;
             }
             const VHACD::Triangle& t = triangles[i];
-            const VHACD::Vertex& p1 = points[t.mI0];
-            const VHACD::Vertex& p2 = points[t.mI1];
-            const VHACD::Vertex& p3 = points[t.mI2];
-
-            uint32_t i1 = GetIndex(vi, p1);
-            uint32_t i2 = GetIndex(vi, p2);
-            uint32_t i3 = GetIndex(vi, p3);
+            const uint32_t i1 = indexOf(points[t.mI0]);
+            const uint32_t i2 = indexOf(points[t.mI1]);
+            const uint32_t i3 = indexOf(points[t.mI2]);
 
             if ( i1 == i2 || i1 == i3 || i2 == i3 )
             {
@@ -5689,12 +5327,10 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                 char scratch[512];
                 snprintf(scratch,
                          sizeof(scratch),
-                         "Skipped %d degenerate triangles", dcount);
+                         "Skipped %u degenerate triangles", dcount);
                 m_params.m_logger->Log(scratch);
             }
         }
-
-        m_vertices = vi.TakeVertices();
     }
 
     // Create the raycast mesh
