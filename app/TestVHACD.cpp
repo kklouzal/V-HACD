@@ -13,21 +13,18 @@
 #include <stdint.h>
 
 #define ENABLE_VHACD_IMPLEMENTATION 1
-#define VHACD_DISABLE_THREADING 0
 #include "VHACD.h"
 #include "wavefront.h"
 #include "FloatMath.h"
 #include "SaveUSDA.h"
 #include "ScopedTime.h"
 
-#include <thread>
 #include <string>
 #include <vector>
 #include <array>
 
 #ifdef _MSC_VER
 #pragma warning(disable:4100 4996)
-#include <conio.h>
 #endif
 
 // Evaluates if this is true or false, returns true if it
@@ -71,8 +68,6 @@ public:
 		flushMessages();
 	}
 
-        // Be aware that if you are running V-HACD asynchronously (in a background thread) this callback will come from
-        // a different thread. So if your print/logging code isn't thread safe, take that into account.
         virtual void Update(const double overallProgress,
                             const double stageProgress,
                             const char* const stage,const char *operation) final
@@ -95,15 +90,6 @@ public:
 			mLastLen = (uint32_t)strlen(scratch);
 			printf("%s", scratch);
 		}
-
-        // This is an optional user callback which is only called when running V-HACD asynchronously.
-        // This is a callback performed to notify the user that the
-        // convex decomposition background process is completed. This call back will occur from
-        // a different thread so the user should take that into account.
-        virtual void NotifyVHACDComplete(void)
-        {
-			Log("VHACD::Complete");
-        }
 
 		virtual void Log(const char* const msg) final
 		{
@@ -169,7 +155,6 @@ int main(int argc,const char **argv)
 		printf("-s <true/false>         : Whether or not to shrinkwrap output to source mesh. Default is true.\n");
 		printf("-f <fillMode>           : Fill mode. Default is 'flood', also 'surface' and 'raycast' are valid.\n");
 		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 64\n");
-		printf("-a <true/false>         : Whether or not to run asynchronously. Default is 'true'\n");
 		printf("-l <minEdgeLength>      : Minimum size of a voxel edge. Default value is 2 voxels.\n");
 		printf("-o <obj/stl/usda>       : Export the convex hulls as a series of wavefront OBJ files, STL files, or a single USDA.\n");
 		printf("-g <true/false>         : If set to false, no logging will be displayed.\n");
@@ -335,20 +320,6 @@ int main(int argc,const char **argv)
 						printf("Invalid maximum hull vertices, must be between 8 and 20484, got %d\n", r);
 					}
 				}
-				else if ( strcmp(option,"-a") == 0 )
-				{
-					if ( getTrueFalse(value,p.m_asyncACD) )
-					{
-						if ( p.m_asyncACD )
-						{
-							printf("Asynchronous mode enabled\n");
-						}
-						else
-						{
-							printf("Synchronous mode disabled\n");
-						}
-					}
-				}
 				else if ( strcmp(option,"-l") == 0 )
 				{
 					int32_t r = atoi(value);
@@ -363,14 +334,7 @@ int main(int argc,const char **argv)
 					}
 				}
 			}
-#if VHACD_DISABLE_THREADING
 			VHACD::IVHACD *iface = VHACD::CreateVHACD();
-#else
-			VHACD::IVHACD *iface = p.m_asyncACD ? VHACD::CreateVHACD_ASYNC() : VHACD::CreateVHACD();
-#endif
-#ifdef _MSC_VER
-			printf("Press the SPACEBAR to cancel convex decomposition before it has completed.\n");
-#endif
 			double *points = new double[w.mVertexCount*3];
 			for (uint32_t i=0; i<w.mVertexCount*3; i++)
 			{
@@ -379,23 +343,7 @@ int main(int argc,const char **argv)
 			bool canceled = false;
 			{
 				ScopedTime st("Computing Convex Decomposition");
-				iface->Compute(points,w.mVertexCount,w.mIndices,w.mTriCount,p);
-				while ( !iface->IsReady() )
-				{
-					std::this_thread::sleep_for(std::chrono::nanoseconds(10000)); // s
-#ifdef _MSC_VER
-					if ( kbhit() )
-					{
-						char c = (char)getch();
-						if ( c == 32 )
-						{
-							printf("Canceling convex decomposition.\n");
-							iface->Cancel();
-							canceled = true;
-						}
-					}
-#endif
-				}
+				canceled = !iface->Compute(points,w.mVertexCount,w.mIndices,w.mTriCount,p);
 				logging.flushMessages();
 			}
 			if ( !canceled && iface->GetNConvexHulls() )

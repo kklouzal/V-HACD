@@ -111,7 +111,6 @@
 // going forward.
 
 #include <stdint.h>
-#include <functional>
 
 #include <vector>
 #include <array>
@@ -304,8 +303,7 @@ class IVHACD
 public:
     /**
     * This optional pure virtual interface is used to notify the caller of the progress
-    * of convex decomposition as well as a signal when it is complete when running in
-    * a background thread
+    * of convex decomposition. It is called on the thread running Compute.
     */
     class IUserCallback
     {
@@ -324,14 +322,6 @@ public:
                             const double stageProgress,
                             const char* const stage,
                             const char* operation) = 0;
-
-        // This is an optional user callback which is only called when running V-HACD asynchronously.
-        // This is a callback performed to notify the user that the
-        // convex decomposition background process is completed. This call back will occur from
-        // a different thread so the user should take that into account.
-        virtual void NotifyVHACDComplete()
-        {
-        }
     };
 
     /**
@@ -342,19 +332,6 @@ public:
     public:
         virtual ~IUserLogger(){};
         virtual void Log(const char* const msg) = 0;
-    };
-
-    /**
-    * An optional user provided pure virtual interface to perform a background task.
-    * This was added by Danny Couture at Epic as they wanted to use their own
-    * threading system instead of the standard library version which is the default.
-    */
-    class IUserTaskRunner
-    {
-    public:
-        virtual ~IUserTaskRunner(){};
-        virtual void* StartTask(std::function<void()> func) = 0;
-        virtual void JoinTask(void* Task) = 0;
     };
 
     /**
@@ -382,7 +359,6 @@ public:
     public:
         IUserCallback*      m_callback{nullptr};            // Optional user provided callback interface for progress
         IUserLogger*        m_logger{nullptr};              // Optional user provided callback interface for log messages
-        IUserTaskRunner*    m_taskRunner{nullptr};          // Optional user provided interface for creating tasks
         uint32_t            m_maxConvexHulls{ 64 };         // The maximum number of convex hulls to produce
         uint32_t            m_resolution{ 400000 };         // The voxel resolution to use
         double              m_minimumVolumePercentErrorAllowed{ 1 }; // if the voxels are within 1% of the volume of the hull, we consider this a close enough approximation
@@ -390,12 +366,12 @@ public:
         bool                m_shrinkWrap{true};             // Whether or not to shrinkwrap the voxel positions to the source mesh on output
         FillMode            m_fillMode{ FillMode::FLOOD_FILL }; // How to fill the interior of the voxelized mesh
         uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull
-        bool                m_asyncACD{ true };             // Whether or not to run asynchronously, taking advantage of additional cores
         uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
     };
 
     /**
-    * Will cause the convex decomposition operation to be canceled early. No results will be produced but the background operation will end as soon as it can.
+    * Requests that a running Compute stop early. It may be called from any thread, including
+    * from IUserCallback::Update. The interrupted Compute returns false and produces no hulls.
     */
     virtual void Cancel() = 0;
 
@@ -407,7 +383,7 @@ public:
     * @param triangles : The indices of triangles in the source mesh in the form of I1,I2,I3, ....
     * @param countTriangles : The number of triangles in the source mesh
     * @param params : The convex decomposition parameters to apply
-    * @return : Returns true if the convex decomposition operation can be started
+    * @return : Returns true when the decomposition ran to completion; false when it was canceled
     */
     virtual bool Compute(const float* const points,
                          const uint32_t countPoints,
@@ -423,7 +399,7 @@ public:
     * @param triangles : The indices of triangles in the source mesh in the form of I1,I2,I3, ....
     * @param countTriangles : The number of triangles in the source mesh
     * @param params : The convex decomposition parameters to apply
-    * @return : Returns true if the convex decomposition operation can be started
+    * @return : Returns true when the decomposition ran to completion; false when it was canceled
     */
     virtual bool Compute(const double* const points,
                          const uint32_t countPoints,
@@ -457,32 +433,6 @@ public:
     * Releases this instance of the V-HACD class
     */
     virtual void Release() = 0; // release IVHACD
-
-    // Will compute the center of mass of the convex hull decomposition results and return it
-    // in 'centerOfMass'.  Returns false if the center of mass could not be computed.
-    virtual bool ComputeCenterOfMass(double centerOfMass[3]) const = 0;
-
-    // In synchronous mode (non-multi-threaded) the state is always 'ready'
-    // In asynchronous mode, this returns true if the background thread is not still actively computing
-    // a new solution.  In an asynchronous config the 'IsReady' call will report any update or log
-    // messages in the caller's current thread.
-    virtual bool IsReady() const
-    {
-        return true;
-    }
-
-    /**
-    * At the request of LegionFu : out_look@foxmail.com
-    * This method will return which convex hull is closest to the source position.
-    * You can use this method to figure out, for example, which vertices in the original
-    * source mesh are best associated with which convex hull.
-    *
-    * @param pos : The input 3d position to test against
-    *
-    * @return : Returns which convex hull this position is closest to.
-    */
-    virtual uint32_t findNearestConvexHull(const double pos[3],
-                                           double& distanceToHull) = 0;
 
 protected:
     virtual ~IVHACD()
@@ -881,8 +831,7 @@ protected:
         return ::VHACD::Vertex( GetX(), GetY(), GetZ());
     }
 
-IVHACD* CreateVHACD();      // Create a synchronous (blocking) implementation of V-HACD
-IVHACD* CreateVHACD_ASYNC();    // Create an asynchronous (non-blocking) implementation of V-HACD
+IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronously on the calling thread
 
 } // namespace VHACD
 
@@ -891,23 +840,17 @@ IVHACD* CreateVHACD_ASYNC();    // Create an asynchronous (non-blocking) impleme
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <float.h>
 #include <limits.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
-#include <future>
-#include <iostream>
 #include <list>
 #include <memory>
-#include <mutex>
 #include <queue>
-#include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -5667,117 +5610,6 @@ void ShrinkWrap(SimpleMesh& sourceConvexHull,
     }
 }
 
-//********************************************************************************************************************
-
-#if !VHACD_DISABLE_THREADING
-
-//********************************************************************************************************************
-// Definition of the ThreadPool
-//********************************************************************************************************************
-
-class ThreadPool {
- public:
-    ThreadPool();
-    ThreadPool(int worker);
-    ~ThreadPool();
-    template<typename F, typename... Args>
-    auto enqueue(F&& f, Args&& ... args)
-#ifndef __cpp_lib_is_invocable
-        -> std::future< typename std::result_of< F( Args... ) >::type>;
-#else
-        -> std::future< typename std::invoke_result_t<F, Args...>>;
-#endif
- private:
-    std::vector<std::thread> workers;
-    std::deque<std::function<void()>> tasks;
-    std::mutex task_mutex;
-    std::condition_variable cv;
-    bool closed;
-};
-
-ThreadPool::ThreadPool()
-    : ThreadPool(1)
-{
-}
-
-ThreadPool::ThreadPool(int worker)
-    : closed(false)
-{
-    workers.reserve(worker);
-    for(int i=0; i<worker; i++)
-    {
-        workers.emplace_back(
-            [this]
-            {
-                std::unique_lock<std::mutex> lock(this->task_mutex);
-                while(true)
-                {
-                    while (this->tasks.empty())
-                    {
-                        if (this->closed)
-                        {
-                            return;
-                        }
-                        this->cv.wait(lock);
-                    }
-                    auto task = this->tasks.front();
-                    this->tasks.pop_front();
-                    lock.unlock();
-                    task();
-                    lock.lock();
-                }
-            }
-        );
-    }
-}
-
-template<typename F, typename... Args>
-auto ThreadPool::enqueue(F&& f, Args&& ... args)
-#ifndef __cpp_lib_is_invocable
-    -> std::future< typename std::result_of< F( Args... ) >::type>
-#else
-    -> std::future< typename std::invoke_result_t<F, Args...>>
-#endif
-{
-
-#ifndef __cpp_lib_is_invocable
-    using return_type = typename std::result_of< F( Args... ) >::type;
-#else
-    using return_type = typename std::invoke_result_t< F, Args... >;
-#endif
-    auto task = std::make_shared<std::packaged_task<return_type()> > (
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-    );
-    auto result = task->get_future();
-
-    {
-        std::unique_lock<std::mutex> lock(task_mutex);
-        if (!closed)
-        {
-            tasks.emplace_back([task]
-            {
-                (*task)();
-            });
-            cv.notify_one();
-        }
-    }
-
-    return result;
-}
-
-ThreadPool::~ThreadPool() {
-    {
-        std::unique_lock<std::mutex> lock(task_mutex);
-        closed = true;
-    }
-    cv.notify_all();
-    for (auto && worker : workers)
-    {
-        worker.join();
-    }
-}
-#endif
-
 enum class Stages
 {
     COMPUTE_BOUNDS_OF_INPUT_MESH,
@@ -5829,8 +5661,7 @@ public:
     // Here we construct the initial convex hull around the
     // entire voxel set
     VoxelHull(Volume& voxels,
-              const IVHACD::Parameters &params,
-              VHACDCallbacks *callbacks);
+              const IVHACD::Parameters &params);
 
     ~VoxelHull() = default;
 
@@ -5880,7 +5711,6 @@ public:
     VHACD::BoundsAABB       m_voxelBounds;
     VHACD::Vect3            m_voxelAdjust;       // Minimum coordinates of the voxel space, with adjustment
     uint32_t                m_depth{ 0 };        // How deep in the recursion of the binary tree this hull is
-    uint32_t                m_index{ 0 };        // Each convex hull is given a unique id to distinguish it from the others
     double                  m_volumeError{ 0 };  // The percentage error from the convex hull volume vs. the voxel volume
     double                  m_voxelVolume{ 0 };  // The volume of the voxels
     double                  m_hullVolume{ 0 };   // The volume of the enclosing convex hull
@@ -5899,12 +5729,8 @@ public:
     VHACD::Vector3<uint32_t>                    m_2{ 0 };
     std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
     std::vector<VHACD::Vertex>                  m_vertices;
-    static uint32_t                             m_voxelHullCount;
     IVHACD::Parameters                          m_params;
-    VHACDCallbacks*                             m_callbacks{ nullptr };
 };
-
-uint32_t VoxelHull::m_voxelHullCount = 0;
 
 VoxelHull::VoxelHull(const VoxelHull& parent,
                      SplitAxis axis,
@@ -5916,7 +5742,6 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
     , m_voxelBounds(m_voxels->GetBounds())
     , m_voxelAdjust(m_voxelBounds.GetMin() - m_voxelScaleHalf)
     , m_depth(parent.m_depth + 1)
-    , m_index(++m_voxelHullCount)
     , m_1(parent.m_1)
     , m_2(parent.m_2)
     , m_params(parent.m_params)
@@ -6044,21 +5869,18 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
 }
 
 VoxelHull::VoxelHull(Volume& voxels,
-                     const IVHACD::Parameters& params,
-                     VHACDCallbacks* callbacks)
+                     const IVHACD::Parameters& params)
     : m_voxels(&voxels)
     , m_voxelScale(m_voxels->GetScale())
     , m_voxelScaleHalf(m_voxelScale * double(0.5))
     , m_voxelBounds(m_voxels->GetBounds())
     , m_voxelAdjust(m_voxelBounds.GetMin() - m_voxelScaleHalf)
-    , m_index(++m_voxelHullCount)
     // Here we get a copy of all voxels which lie on the surface mesh
     , m_surfaceVoxels(m_voxels->GetSurfaceVoxels())
     // Now we get a copy of all voxels which are considered part of the 'interior' of the source mesh
     , m_interiorVoxels(m_voxels->GetInteriorVoxels())
     , m_2(m_voxels->GetDimensions() - 1)
     , m_params(params)
-    , m_callbacks(callbacks)
 {
     CollectHullPoints();
     ComputeConvexHull();
@@ -6248,18 +6070,14 @@ void VoxelHull::PerformPlaneSplit()
     }
 }
 
-class VHACDImpl;
-
 // This class represents a single task to compute the volume error
 // of two convex hulls combined
 class CostTask
 {
 public:
-    VHACDImpl*          m_this{ nullptr };
     IVHACD::ConvexHull* m_hullA{ nullptr };
     IVHACD::ConvexHull* m_hullB{ nullptr };
     double              m_concavity{ 0 }; // concavity of the two combined
-    std::future<void>   m_future;
 };
 
 class HullPair
@@ -6290,8 +6108,6 @@ bool HullPair::operator<(const HullPair &h) const
 {
     return m_concavity > h.m_concavity ? true : false;
 }
-
-// void jobCallback(void* userPtr);
 
 class VHACDImpl : public IVHACD, public VHACDCallbacks
 {
@@ -6330,29 +6146,6 @@ public:
     void Clean() override final;  // release internally allocated memory
 
     void Release() override final;
-
-    // Will compute the center of mass of the convex hull decomposition results and return it
-    // in 'centerOfMass'.  Returns false if the center of mass could not be computed.
-    bool ComputeCenterOfMass(double centerOfMass[3]) const override final;
-
-    // In synchronous mode (non-multi-threaded) the state is always 'ready'
-    // In asynchronous mode, this returns true if the background thread is not still actively computing
-    // a new solution.  In an asynchronous config the 'IsReady' call will report any update or log
-    // messages in the caller's current thread.
-    bool IsReady(void) const override final;
-
-    /**
-    * At the request of LegionFu : out_look@foxmail.com
-    * This method will return which convex hull is closest to the source position.
-    * You can use this method to figure out, for example, which vertices in the original
-    * source mesh are best associated with which convex hull.
-    *
-    * @param pos : The input 3d position to test against
-    *
-    * @return : Returns which convex hull this position is closest to.
-    */
-    uint32_t findNearestConvexHull(const double pos[3],
-                                   double& distanceToHull) override final;
 
 // private:
     bool Compute(const std::vector<VHACD::Vertex>& points,
@@ -6432,7 +6225,6 @@ public:
     std::vector<std::unique_ptr<VoxelHull>>             m_voxelHulls; // completed voxel hulls
     std::vector<std::unique_ptr<VoxelHull>>             m_pendingHulls;
 
-    std::vector<std::unique_ptr<AABBTree>>              m_trees;
     VHACD::AABBTree                                     m_AABBTree;
     VHACD::Volume                                       m_voxelize;
     VHACD::Vect3                                        m_center;
@@ -6449,9 +6241,6 @@ public:
     VHACD::Vect3                                        m_voxelBmax;
     uint32_t                                            m_meshId{ 0 };
     std::priority_queue<HullPair>                       m_hullPairQueue;
-#if !VHACD_DISABLE_THREADING
-    std::unique_ptr<ThreadPool>                         m_threadPool{ nullptr };
-#endif
     std::unordered_map<uint32_t, IVHACD::ConvexHull*>   m_hulls;
 
     double                                              m_overallProgress{ double(0.0) };
@@ -6539,12 +6328,6 @@ bool VHACDImpl::GetConvexHull(const uint32_t index,
 
 void VHACDImpl::Clean()
 {
-#if !VHACD_DISABLE_THREADING
-    m_threadPool = nullptr;
-#endif
-
-    m_trees.clear();
-
     for (auto& ch : m_convexHulls)
     {
         ReleaseConvexHull(ch);
@@ -6570,70 +6353,6 @@ void VHACDImpl::Release()
     delete this;
 }
 
-bool VHACDImpl::ComputeCenterOfMass(double centerOfMass[3]) const
-{
-    bool ret = false;
-
-    return ret;
-}
-
-bool VHACDImpl::IsReady() const
-{
-    return true;
-}
-
-uint32_t VHACDImpl::findNearestConvexHull(const double pos[3],
-                                          double& distanceToHull)
-{
-    uint32_t ret = 0; // The default return code is zero
-
-    uint32_t hullCount = GetNConvexHulls();
-    distanceToHull = 0;
-    // First, make sure that we have valid and completed results
-    if ( hullCount )
-    {
-        // See if we already have AABB trees created for each convex hull
-        if ( m_trees.empty() )
-        {
-            // For each convex hull, we generate an AABB tree for fast closest point queries
-            for (uint32_t i = 0; i < hullCount; i++)
-            {
-                VHACD::IVHACD::ConvexHull ch;
-                GetConvexHull(i,ch);
-                // Pass the triangle mesh to create an AABB tree instance based on it.
-                m_trees.emplace_back(new AABBTree(ch.m_points,
-                                                  ch.m_triangles));
-            }
-        }
-        // We now compute the closest point to each convex hull and save the nearest one
-        double closest = 1e99;
-        for (uint32_t i = 0; i < hullCount; i++)
-        {
-            std::unique_ptr<AABBTree>& t = m_trees[i];
-            if ( t )
-            {
-                VHACD::Vect3 closestPoint;
-                VHACD::Vect3 position(pos[0],
-                                      pos[1],
-                                      pos[2]);
-                if ( t->GetClosestPointWithinDistance(position, 1e99, closestPoint))
-                {
-                    VHACD::Vect3 d = position - closestPoint;
-                    double distanceSquared = d.GetNormSquared();
-                    if ( distanceSquared < closest )
-                    {
-                        closest = distanceSquared;
-                        ret = i;
-                    }
-                }
-            }
-        }
-        distanceToHull = sqrt(closest); // compute the distance to the nearest convex hull
-    }
-
-    return ret;
-}
-
 bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
                         const std::vector<VHACD::Triangle>& triangles,
                         const Parameters& params)
@@ -6644,12 +6363,6 @@ bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
     m_canceled = false;
 
     Clean(); // release any previous results
-#if !VHACD_DISABLE_THREADING
-    if ( m_params.m_asyncACD )
-    {
-        m_threadPool = std::unique_ptr<ThreadPool>(new ThreadPool(8));
-    }
-#endif
     CopyInputMesh(points,
                   triangles);
     if ( !m_canceled )
@@ -6671,9 +6384,6 @@ bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
     {
         ret = true;
     }
-#if !VHACD_DISABLE_THREADING
-    m_threadPool = nullptr;
-#endif
     return ret;
 }
 
@@ -6799,8 +6509,7 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                         0,
                         "Build initial ConvexHull");
         std::unique_ptr<VoxelHull> vh = std::unique_ptr<VoxelHull>(new VoxelHull(m_voxelize,
-                                                                                 m_params,
-                                                                                 this));
+                                                                                 m_params));
         if ( vh->m_convexHull )
         {
             m_overallHullVolume = vh->m_convexHull->m_volume;
@@ -6845,16 +6554,6 @@ void VHACDImpl::ReleaseConvexHull(ConvexHull* ch)
     }
 }
 
-void jobCallback(std::unique_ptr<VoxelHull>& userPtr)
-{
-    userPtr->PerformPlaneSplit();
-}
-
-void computeMergeCostTask(CostTask& ptr)
-{
-    ptr.m_this->PerformMergeCostTask(ptr);
-}
-
 void VHACDImpl::PerformConvexDecomposition()
 {
     {
@@ -6879,40 +6578,12 @@ void VHACDImpl::PerformConvexDecomposition()
             }
             // First we make a copy of the hulls we are processing
             std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
-            // For each hull we want to split, we either
-            // immediately perform the plane split or we post it as
-            // a job to be performed in a background thread
-            std::vector<std::future<void>> futures(oldList.size());
-            uint32_t futureCount = 0;
+            // Split every hull on this level that is not yet complete
             for (auto& i : oldList)
             {
-                if ( i->IsComplete() || count > MaxConvexHullFragments )
+                if ( !i->IsComplete() && count <= MaxConvexHullFragments )
                 {
-                }
-                else
-                {
-#if !VHACD_DISABLE_THREADING
-                    if ( m_threadPool )
-                    {
-                        futures[futureCount] = m_threadPool->enqueue([&i]
-                        {
-                            jobCallback(i);
-                        });
-                        futureCount++;
-                    }
-                    else
-#endif
-                    {
-                        i->PerformPlaneSplit();
-                    }
-                }
-            }
-            // Wait for any outstanding jobs to complete in the background threads
-            if ( futureCount )
-            {
-                for (uint32_t i = 0; i < futureCount; i++)
-                {
-                    futures[i].get();
+                    i->PerformPlaneSplit();
                 }
             }
             // Now, we rebuild the pending convex hulls list by
@@ -7012,51 +6683,20 @@ void VHACDImpl::PerformConvexDecomposition()
                     CostTask ct;
                     ct.m_hullA = chA;
                     ct.m_hullB = chB;
-                    ct.m_this = this;
 
-                    if ( DoFastCost(ct) )
+                    if ( !DoFastCost(ct) )
                     {
-                    }
-                    else
-                    {
-                        tasks.push_back(std::move(ct));
-                        CostTask* task = &tasks.back();
-#if !VHACD_DISABLE_THREADING
-                        if ( m_threadPool )
-                        {
-                            task->m_future = m_threadPool->enqueue([task]
-                            {
-                                computeMergeCostTask(*task);
-                            });
-                        }
-#endif
+                        tasks.push_back(ct);
                     }
                 }
             }
 
             if ( !m_canceled )
             {
-#if !VHACD_DISABLE_THREADING
-                if ( m_threadPool )
+                for (CostTask& task : tasks)
                 {
-                    for (CostTask& task : tasks)
-                    {
-                        task.m_future.get();
-                    }
-
-                    for (CostTask& task : tasks)
-                    {
-                        AddCostToPriorityQueue(task);
-                    }
-                }
-                else
-#endif
-                {
-                    for (CostTask& task : tasks)
-                    {
-                        PerformMergeCostTask(task);
-                        AddCostToPriorityQueue(task);
-                    }
+                    PerformMergeCostTask(task);
+                    AddCostToPriorityQueue(task);
                 }
                 ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
                                100,
@@ -7134,41 +6774,15 @@ void VHACDImpl::PerformConvexDecomposition()
                             CostTask ct;
                             ct.m_hullA = combinedHull;
                             ct.m_hullB = secondHull;
-                            ct.m_this = this;
-                            if ( DoFastCost(ct) )
+                            if ( !DoFastCost(ct) )
                             {
-                            }
-                            else
-                            {
-                                tasks.push_back(std::move(ct));
+                                tasks.push_back(ct);
                             }
                         }
                         m_hulls[combinedHull->m_meshId] = combinedHull;
-                        // See how many merge cost tasks were posted
-                        // If there are 8 or more and we are running asynchronously, then do them that way.
-#if !VHACD_DISABLE_THREADING
-                        if ( m_threadPool && tasks.size() >= 2)
+                        for (CostTask& task : tasks)
                         {
-                            for (CostTask& task : tasks)
-                            {
-                                task.m_future = m_threadPool->enqueue([&task]
-                                {
-                                    computeMergeCostTask(task);
-                                });
-                            }
-
-                            for (CostTask& task : tasks)
-                            {
-                                task.m_future.get();
-                            }
-                        }
-                        else
-#endif
-                        {
-                            for (CostTask& task : tasks)
-                            {
-                                PerformMergeCostTask(task);
-                            }
+                            PerformMergeCostTask(task);
                         }
 
                         for (CostTask& task : tasks)
@@ -7503,376 +7117,6 @@ IVHACD* CreateVHACD(void)
     VHACDImpl *ret = new VHACDImpl;
     return static_cast< IVHACD *>(ret);
 }
-
-IVHACD* CreateVHACD(void);
-
-#if !VHACD_DISABLE_THREADING
-
-class LogMessage
-{
-public:
-    double  m_overallProgress{ double(-1.0) };
-    double  m_stageProgress{ double(-1.0) };
-    std::string m_stage;
-    std::string m_operation;
-};
-
-class VHACDAsyncImpl : public VHACD::IVHACD,
-                       public VHACD::IVHACD::IUserCallback,
-                       VHACD::IVHACD::IUserLogger,
-                       VHACD::IVHACD::IUserTaskRunner
-{
-public:
-    VHACDAsyncImpl() = default;
-
-    ~VHACDAsyncImpl() override;
-
-    void Cancel() override final;
-
-    bool Compute(const float* const points,
-                 const uint32_t countPoints,
-                 const uint32_t* const triangles,
-                 const uint32_t countTriangles,
-                 const Parameters& params) override final;
-
-    bool Compute(const double* const points,
-                 const uint32_t countPoints,
-                 const uint32_t* const triangles,
-                 const uint32_t countTriangles,
-                 const Parameters& params) override final;
-
-    bool GetConvexHull(const uint32_t index,
-                       VHACD::IVHACD::ConvexHull& ch) const override final;
-
-    uint32_t GetNConvexHulls() const override final;
-
-    void Clean() override final; // release internally allocated memory
-
-    void Release() override final; // release IVHACD
-
-    // Will compute the center of mass of the convex hull decomposition results and return it
-    // in 'centerOfMass'.  Returns false if the center of mass could not be computed.
-    bool ComputeCenterOfMass(double centerOfMass[3]) const override;
-
-    bool IsReady() const override final;
-
-    /**
-    * At the request of LegionFu : out_look@foxmail.com
-    * This method will return which convex hull is closest to the source position.
-    * You can use this method to figure out, for example, which vertices in the original
-    * source mesh are best associated with which convex hull.
-    *
-    * @param pos : The input 3d position to test against
-    *
-    * @return : Returns which convex hull this position is closest to.
-    */
-    uint32_t findNearestConvexHull(const double pos[3],
-                                   double& distanceToHull) override final;
-
-    void Update(const double overallProgress,
-                const double stageProgress,
-                const char* const stage,
-                const char *operation) override final;
-
-    void Log(const char* const msg) override final;
-
-    void* StartTask(std::function<void()> func) override;
-
-    void JoinTask(void* Task) override;
-
-    bool Compute(const Parameters params);
-
-    bool ComputeNow(const std::vector<VHACD::Vertex>& points,
-                    const std::vector<VHACD::Triangle>& triangles,
-                    const Parameters& _desc);
-
-    // As a convenience for the calling application we only send it update and log messages from it's own main
-    // thread.  This reduces the complexity burden on the caller by making sure it only has to deal with log
-    // messages in it's main application thread.
-    void ProcessPendingMessages() const;
-
-private:
-    VHACD::VHACDImpl                m_VHACD;
-    std::vector<VHACD::Vertex>      m_vertices;
-    std::vector<VHACD::Triangle>    m_indices;
-    VHACD::IVHACD::IUserCallback*   m_callback{ nullptr };
-    VHACD::IVHACD::IUserLogger*     m_logger{ nullptr };
-    VHACD::IVHACD::IUserTaskRunner* m_taskRunner{ nullptr };
-    void*                           m_task{ nullptr };
-    std::atomic<bool>               m_running{ false };
-    std::atomic<bool>               m_cancel{ false };
-
-    // Thread safe caching mechanism for messages and update status.
-    // This is so that caller always gets messages in his own thread
-    // Member variables are marked as 'mutable' since the message dispatch function
-    // is called from const query methods.
-    mutable std::mutex              m_messageMutex;
-    mutable std::vector<LogMessage> m_messages;
-    mutable std::atomic<bool>       m_haveMessages{ false };
-};
-
-VHACDAsyncImpl::~VHACDAsyncImpl()
-{
-    Cancel();
-}
-
-void VHACDAsyncImpl::Cancel()
-{
-    m_cancel = true;
-    m_VHACD.Cancel();
-
-    if (m_task)
-    {
-        m_taskRunner->JoinTask(m_task); // Wait for the thread to fully exit before we delete the instance
-        m_task = nullptr;
-    }
-    m_cancel = false; // clear the cancel semaphore
-}
-
-bool VHACDAsyncImpl::Compute(const float* const points,
-                             const uint32_t countPoints,
-                             const uint32_t* const triangles,
-                             const uint32_t countTriangles,
-                             const Parameters& params)
-{
-    m_vertices.reserve(countPoints);
-    for (uint32_t i = 0; i < countPoints; ++i)
-    {
-        m_vertices.emplace_back(points[i * 3 + 0],
-                                points[i * 3 + 1],
-                                points[i * 3 + 2]);
-    }
-
-    m_indices.reserve(countTriangles);
-    for (uint32_t i = 0; i < countTriangles; ++i)
-    {
-        m_indices.emplace_back(triangles[i * 3 + 0],
-                               triangles[i * 3 + 1],
-                               triangles[i * 3 + 2]);
-    }
-
-    return Compute(params);
-}
-
-bool VHACDAsyncImpl::Compute(const double* const points,
-                             const uint32_t countPoints,
-                             const uint32_t* const triangles,
-                             const uint32_t countTriangles,
-                             const Parameters& params)
-{
-    // We need to copy the input vertices and triangles into our own buffers so we can operate
-    // on them safely from the background thread.
-    // Can't be local variables due to being asynchronous
-    m_vertices.reserve(countPoints);
-    for (uint32_t i = 0; i < countPoints; ++i)
-    {
-        m_vertices.emplace_back(points[i * 3 + 0],
-                                points[i * 3 + 1],
-                                points[i * 3 + 2]);
-    }
-
-    m_indices.reserve(countTriangles);
-    for (uint32_t i = 0; i < countTriangles; ++i)
-    {
-        m_indices.emplace_back(triangles[i * 3 + 0],
-                               triangles[i * 3 + 1],
-                               triangles[i * 3 + 2]);
-    }
-
-    return Compute(params);
-}
-
-bool VHACDAsyncImpl::GetConvexHull(const uint32_t index,
-                                   VHACD::IVHACD::ConvexHull& ch) const
-{
-    return m_VHACD.GetConvexHull(index,
-                                 ch);
-}
-
-uint32_t VHACDAsyncImpl::GetNConvexHulls() const
-{
-    ProcessPendingMessages();
-    return m_VHACD.GetNConvexHulls();
-}
-
-void VHACDAsyncImpl::Clean()
-{
-    Cancel();
-    m_VHACD.Clean();
-}
-
-void VHACDAsyncImpl::Release()
-{
-    delete this;
-}
-
-bool VHACDAsyncImpl::ComputeCenterOfMass(double centerOfMass[3]) const
-{
-    bool ret = false;
-
-    centerOfMass[0] = 0;
-    centerOfMass[1] = 0;
-    centerOfMass[2] = 0;
-
-    if (IsReady())
-    {
-        ret = m_VHACD.ComputeCenterOfMass(centerOfMass);
-    }
-    return ret;
-}
-
-bool VHACDAsyncImpl::IsReady() const
-{
-    ProcessPendingMessages();
-    return !m_running;
-}
-
-uint32_t VHACDAsyncImpl::findNearestConvexHull(const double pos[3],
-                                               double& distanceToHull)
-{
-    uint32_t ret = 0; // The default return code is zero
-
-    distanceToHull = 0;
-    // First, make sure that we have valid and completed results
-    if (IsReady() )
-    {
-        ret = m_VHACD.findNearestConvexHull(pos,distanceToHull);
-    }
-
-    return ret;
-}
-
-void VHACDAsyncImpl::Update(const double overallProgress,
-                            const double stageProgress,
-                            const char* const stage,
-                            const char* operation)
-{
-    m_messageMutex.lock();
-    LogMessage m;
-    m.m_operation = std::string(operation);
-    m.m_overallProgress = overallProgress;
-    m.m_stageProgress = stageProgress;
-    m.m_stage = std::string(stage);
-    m_messages.push_back(m);
-    m_haveMessages = true;
-    m_messageMutex.unlock();
-}
-
-void VHACDAsyncImpl::Log(const char* const msg)
-{
-    m_messageMutex.lock();
-    LogMessage m;
-    m.m_operation = std::string(msg);
-    m_haveMessages = true;
-    m_messages.push_back(m);
-    m_messageMutex.unlock();
-}
-
-void* VHACDAsyncImpl::StartTask(std::function<void()> func)
-{
-    return new std::thread(func);
-}
-
-void VHACDAsyncImpl::JoinTask(void* Task)
-{
-    std::thread* t = static_cast<std::thread*>(Task);
-    t->join();
-    delete t;
-}
-
-bool VHACDAsyncImpl::Compute(Parameters params)
-{
-    Cancel(); // if we previously had a solution running; cancel it.
-
-    m_taskRunner = params.m_taskRunner ? params.m_taskRunner : this;
-    params.m_taskRunner = m_taskRunner;
-
-    m_running = true;
-    m_task = m_taskRunner->StartTask([this, params]() {
-        ComputeNow(m_vertices,
-                   m_indices,
-                   params);
-        // If we have a user provided callback and the user did *not* call 'cancel' we notify him that the
-        // task is completed. However..if the user selected 'cancel' we do not send a completed notification event.
-        if (params.m_callback && !m_cancel)
-        {
-            params.m_callback->NotifyVHACDComplete();
-        }
-        m_running = false;
-    });
-    return true;
-}
-
-bool VHACDAsyncImpl::ComputeNow(const std::vector<VHACD::Vertex>& points,
-                                const std::vector<VHACD::Triangle>& triangles,
-                                const Parameters& _desc)
-{
-    uint32_t ret = 0;
-
-    Parameters desc;
-    m_callback = _desc.m_callback;
-    m_logger = _desc.m_logger;
-
-    desc = _desc;
-    // Set our intercepting callback interfaces if non-null
-    desc.m_callback = _desc.m_callback ? this : nullptr;
-    desc.m_logger = _desc.m_logger ? this : nullptr;
-
-    // If not task runner provided, then use the default one
-    if (desc.m_taskRunner == nullptr)
-    {
-        desc.m_taskRunner = this;
-    }
-
-    bool ok = m_VHACD.Compute(points,
-                              triangles,
-                              desc);
-    if (ok)
-    {
-        ret = m_VHACD.GetNConvexHulls();
-    }
-
-    return ret ? true : false;
-}
-
-void VHACDAsyncImpl::ProcessPendingMessages() const
-{
-    if (m_cancel)
-    {
-        return;
-    }
-    if ( m_haveMessages )
-    {
-        m_messageMutex.lock();
-        for (auto& i : m_messages)
-        {
-            if ( i.m_overallProgress == -1 )
-            {
-                if ( m_logger )
-                {
-                    m_logger->Log(i.m_operation.c_str());
-                }
-            }
-            else if ( m_callback )
-            {
-                m_callback->Update(i.m_overallProgress,
-                                   i.m_stageProgress,
-                                   i.m_stage.c_str(),
-                                   i.m_operation.c_str());
-            }
-        }
-        m_messages.clear();
-        m_haveMessages = false;
-        m_messageMutex.unlock();
-    }
-}
-
-IVHACD* CreateVHACD_ASYNC()
-{
-    VHACDAsyncImpl* m = new VHACDAsyncImpl;
-    return static_cast<IVHACD*>(m);
-}
-#endif
 
 } // namespace VHACD
 
