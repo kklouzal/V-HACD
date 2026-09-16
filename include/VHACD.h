@@ -338,7 +338,7 @@ public:
         std::vector<VHACD::Triangle>    m_triangles;
 
         double                          m_volume{ 0 };          // The volume of the convex hull
-        VHACD::Vect3                    m_center{ 0, 0, 0 };    // The centroid of the convex hull
+        VHACD::Vect3                    m_center{ 0, 0, 0 };    // Center of mass of the hull as a uniform solid (area centroid for a flat hull)
         uint32_t                        m_meshId{ 0 };          // A unique id for this convex hull
         VHACD::Vect3            mBmin;                  // Bounding box minimum of the AABB
         VHACD::Vect3            mBmax;                  // Bounding box maximum of the AABB
@@ -968,198 +968,50 @@ VHACD::Vect3 VHACD::BoundsAABB::GetSize() const
     return GetMax() - GetMin();
 }
 
-/*
- * Relies on three way comparison, which std::sort doesn't use
- */
-template <class T, class dCompareKey>
-void Sort(T* const array, int elements)
+// Center of mass of a closed triangle mesh as a uniform solid. A flat mesh has no volume, so its area
+// centroid is used instead, and the vertex average when it has no area either.
+void ComputeCentroid(const std::vector<VHACD::Vertex>& points,
+                     const std::vector<VHACD::Triangle>& indices,
+                     VHACD::Vect3& center)
 {
-    const int batchSize = 8;
-    int stack[1024][2];
-
-    stack[0][0] = 0;
-    stack[0][1] = elements - 1;
-    int stackIndex = 1;
-    const dCompareKey comparator;
-    while (stackIndex)
+    center = VHACD::Vect3(0);
+    if ( points.empty() )
     {
-        stackIndex--;
-        int lo = stack[stackIndex][0];
-        int hi = stack[stackIndex][1];
-        if ((hi - lo) > batchSize)
-        {
-            int mid = (lo + hi) >> 1;
-            if (comparator.Compare(array[lo], array[mid]) > 0)
-            {
-                std::swap(array[lo],
-                          array[mid]);
-            }
-            if (comparator.Compare(array[mid], array[hi]) > 0)
-            {
-                std::swap(array[mid],
-                          array[hi]);
-            }
-            if (comparator.Compare(array[lo], array[mid]) > 0)
-            {
-                std::swap(array[lo],
-                          array[mid]);
-            }
-            int i = lo + 1;
-            int j = hi - 1;
-            const T pivot(array[mid]);
-            do
-            {
-                while (comparator.Compare(array[i], pivot) < 0)
-                {
-                    i++;
-                }
-                while (comparator.Compare(array[j], pivot) > 0)
-                {
-                    j--;
-                }
-
-                if (i <= j)
-                {
-                    std::swap(array[i],
-                              array[j]);
-                    i++;
-                    j--;
-                }
-            } while (i <= j);
-
-            if (i < hi)
-            {
-                stack[stackIndex][0] = i;
-                stack[stackIndex][1] = hi;
-                stackIndex++;
-            }
-            if (lo < j)
-            {
-                stack[stackIndex][0] = lo;
-                stack[stackIndex][1] = j;
-                stackIndex++;
-            }
-            assert(stackIndex < int(sizeof(stack) / (2 * sizeof(stack[0][0]))));
-        }
+        return;
     }
-
-    int stride = batchSize + 1;
-    if (elements < stride)
+    const VHACD::Vect3 origin(points[0]);
+    VHACD::Vect3 volumeMoment(0);
+    VHACD::Vect3 areaMoment(0);
+    double volume6 = 0; // six times the signed volume
+    double area2 = 0;   // twice the area
+    for (const VHACD::Triangle& t : indices)
     {
-        stride = elements;
+        const VHACD::Vect3 a(points[t.mI0]);
+        const VHACD::Vect3 b(points[t.mI1]);
+        const VHACD::Vect3 c(points[t.mI2]);
+        const double tetra6 = (a - origin).Dot((b - origin).Cross(c - origin));
+        volumeMoment += (origin + a + b + c) * tetra6;
+        volume6 += tetra6;
+        const double triangle2 = (b - a).Cross(c - a).GetNorm();
+        areaMoment += (a + b + c) * triangle2;
+        area2 += triangle2;
     }
-    for (int i = 1; i < stride; ++i)
+    if ( std::abs(volume6) > 1e-9 * area2 * std::sqrt(area2) )
     {
-        if (comparator.Compare(array[0], array[i]) > 0)
-        {
-            std::swap(array[0],
-                      array[i]);
-        }
+        center = volumeMoment / (4.0 * volume6);
     }
-
-    for (int i = 1; i < elements; ++i)
+    else if ( area2 > 0 )
     {
-        int j = i;
-        const T tmp(array[i]);
-        for (; comparator.Compare(array[j - 1], tmp) > 0; --j)
-        {
-            assert(j > 0);
-            array[j] = array[j - 1];
-        }
-        array[j] = tmp;
-    }
-}
-
-/*
-Maintaining comment due to attribution
-Purpose:
-
-TRIANGLE_AREA_3D computes the area of a triangle in 3D.
-
-Modified:
-
-22 April 1999
-
-Author:
-
-John Burkardt
-
-Parameters:
-
-Input, double X1, Y1, Z1, X2, Y2, Z2, X3, Y3, Z3, the (getX,getY,getZ)
-coordinates of the corners of the triangle.
-
-Output, double TRIANGLE_AREA_3D, the area of the triangle.
-*/
-double ComputeArea(const VHACD::Vect3& p1,
-                   const VHACD::Vect3& p2,
-                   const VHACD::Vect3& p3)
-{
-    /*
-    Find the projection of (P3-P1) onto (P2-P1).
-    */
-    double base = (p2 - p1).GetNorm();
-    /*
-    The height of the triangle is the length of (P3-P1) after its
-    projection onto (P2-P1) has been subtracted.
-    */
-    double height;
-    if (base == double(0.0))
-    {
-        height = double(0.0);
+        center = areaMoment / (3.0 * area2);
     }
     else
     {
-        double dot = (p3 - p1).Dot(p2 - p1);
-        double alpha = dot / (base * base);
-
-        VHACD::Vect3 a = p3 - p1 - alpha * (p2 - p1);
-        height = a.GetNorm();
-    }
-
-    return double(0.5) * base * height;
-}
-
-bool ComputeCentroid(const std::vector<VHACD::Vertex>& points,
-                     const std::vector<VHACD::Triangle>& indices,
-                     VHACD::Vect3& center)
-
-{
-    bool ret = false;
-    if (points.size())
-    {
-        center = VHACD::Vect3(0);
-
-        VHACD::Vect3 numerator(0);
-        double denominator = 0;
-
-        for (uint32_t i = 0; i < indices.size(); i++)
+        for (const VHACD::Vertex& p : points)
         {
-            uint32_t i1 = indices[i].mI0;
-            uint32_t i2 = indices[i].mI1;
-            uint32_t i3 = indices[i].mI2;
-
-            const VHACD::Vect3& p1 = points[i1];
-            const VHACD::Vect3& p2 = points[i2];
-            const VHACD::Vect3& p3 = points[i3];
-
-            // Compute the average of the sum of the three positions
-            VHACD::Vect3 sum = (p1 + p2 + p3) / 3;
-
-            // Compute the area of this triangle
-            double area = ComputeArea(p1,
-                                      p2,
-                                      p3);
-
-            numerator += (sum * area);
-
-            denominator += area;
+            center += VHACD::Vect3(p);
         }
-        double recip = 1 / denominator;
-        center = numerator * recip;
-        ret = true;
+        center /= double(points.size());
     }
-    return ret;
 }
 
 double Determinant3x3(const std::array<VHACD::Vect3, 3>& matrix,
@@ -1893,6 +1745,7 @@ private:
                                              ConvexHullVertex* const points,
                                              int count,
                                              int baseIndex,
+                                             int depth,
                                              NodeBundle<ConvexHullAABBTreeNode>& memoryPool) const;
 
     std::list<ConvexHullFace>::iterator AddFace(int i0,
@@ -2029,9 +1882,6 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
                            double distTol,
                            int maxVertexCount)
 {
-    size_t treeCount = vertexCloud.size() / (VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE >> 1);
-    treeCount = std::max(treeCount, size_t(4)) * 2;
-
     std::vector<ConvexHullVertex> points(vertexCloud.size());
     /*
      * treePool provides a memory pool for the AABB tree
@@ -2065,51 +1915,29 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
 
 void ConvexHull::GetUniquePoints(std::vector<ConvexHullVertex>& points)
 {
-    class CompareVertex
-    {
-        public:
-        int Compare(const ConvexHullVertex& elementA, const ConvexHullVertex& elementB) const
+    // Coordinates are finite (Compute validates its input), so this is a strict weak order.
+    const auto lexicographicLess = [](const ConvexHullVertex& a, const ConvexHullVertex& b) {
+        for (int i = 0; i < 3; i++)
         {
-            for (int i = 0; i < 3; i++)
+            if (a[i] != b[i])
             {
-                if (elementA[i] < elementB[i])
-                {
-                    return -1;
-                }
-                else if (elementA[i] > elementB[i])
-                {
-                    return 1;
-                }
+                return a[i] < b[i];
             }
-            return 0;
         }
+        return false;
     };
-
-    int count = int(points.size());
-    Sort<ConvexHullVertex, CompareVertex>(points.data(),
-                                          count);
-
-    int indexCount = 0;
-    CompareVertex compareVertex;
-    for (int i = 1; i < count; ++i)
-    {
-        for (; i < count; ++i)
-        {
-            if (compareVertex.Compare(points[indexCount], points[i]))
-            {
-                indexCount++;
-                points[indexCount] = points[i];
-                break;
-            }
-        }
-    }
-    points.resize(indexCount + 1);
+    const auto samePosition = [](const ConvexHullVertex& a, const ConvexHullVertex& b) {
+        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+    };
+    std::sort(points.begin(), points.end(), lexicographicLess);
+    points.erase(std::unique(points.begin(), points.end(), samePosition), points.end());
 }
 
 ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* const parent,
                                                      ConvexHullVertex* const points,
                                                      int count,
                                                      int baseIndex,
+                                                     int depth,
                                                      NodeBundle<ConvexHullAABBTreeNode>& memoryPool) const
 {
     ConvexHullAABBTreeNode* tree = nullptr;
@@ -2194,11 +2022,14 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
             }
         } while (i0 <= i1);
 
-        if (i0 == 0)
-        {
-            i0 = count / 2;
-        }
-        if (i0 >= (count - 1))
+        // A mean split can peel off a few points per level, so its depth is unbounded in general. From
+        // BalancedSplitDepth on, a side holding under a third falls back to the middle index. Each level then
+        // keeps at most two thirds of its points plus one, so any int point count finishes within 77 levels,
+        // which bounds the recursion and the SupportVertex stack (one entry per level plus one). Voxel and
+        // hull point sets reach 17 levels on the engine corpus, so their trees are unchanged.
+        static constexpr int BalancedSplitDepth = 24;
+        if (i0 == 0 || i0 >= (count - 1) ||
+            (depth >= BalancedSplitDepth && (i0 < count / 3 || count - i0 < count / 3)))
         {
             i0 = count / 2;
         }
@@ -2212,11 +2043,13 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
                                         points,
                                         i0,
                                         baseIndex,
+                                        depth + 1,
                                         memoryPool);
         tree->m_right = BuildTreeRecurse(tree,
                                          &points[i0],
                                          count - i0,
                                          i0 + baseIndex,
+                                         depth + 1,
                                          memoryPool);
     }
 
@@ -2244,6 +2077,7 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeOld(std::vector<ConvexHullVertex>& 
                             points.data(),
                             count,
                             0,
+                            0,
                             memoryPool);
 }
 
@@ -2252,7 +2086,7 @@ int ConvexHull::SupportVertex(ConvexHullAABBTreeNode** const treePointer,
                               const VHACD::Vect3& dirPlane,
                               const bool removeEntry) const
 {
-#define VHACD_STACK_DEPTH_3D 64
+#define VHACD_STACK_DEPTH_3D 96 // BuildTreeRecurse bounds the tree to 77 levels
     double aabbProjection[VHACD_STACK_DEPTH_3D];
     ConvexHullAABBTreeNode* stackPool[VHACD_STACK_DEPTH_3D];
 
@@ -2691,7 +2525,7 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
             points[index].m_mark = 1;
 
             coneList.clear();
-            for (std::list<ConvexHullFace>::iterator node1 : deleteList)
+            for (const std::list<ConvexHullFace>::iterator& node1 : deleteList)
             {
                 ConvexHullFace& face1 = *node1;
                 assert(face1.m_mark == 1);
@@ -2721,7 +2555,9 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                 }
             }
 
-            for (std::size_t i = 0; i < coneList.size() - 1; ++i)
+            // An exterior point sees at least one face but never all of them, so the horizon is non-empty.
+            assert(!coneList.empty());
+            for (std::size_t i = 0; i + 1 < coneList.size(); ++i)
             {
                 std::list<ConvexHullFace>::iterator nodeA = coneList[i];
                 ConvexHullFace& faceA = *nodeA;
@@ -2753,7 +2589,7 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                 }
             }
 
-            for (std::list<ConvexHullFace>::iterator node : deleteList)
+            for (const std::list<ConvexHullFace>::iterator& node : deleteList)
             {
                 auto it = std::find(boundaryFaces.begin(),
                                     boundaryFaces.end(),
@@ -3767,7 +3603,7 @@ bool TriBoxOverlap(const VHACD::Vect3& boxCenter,
 
     if (!AxisTest( e1[2], -e1[1], fez, fey, v0[1], v0[2], v2[1], v2[2], boxHalfSize[1], boxHalfSize[2])) return 0; // X01
     if (!AxisTest(-e1[2],  e1[0], fez, fex, v0[0], v0[2], v2[0], v2[2], boxHalfSize[0], boxHalfSize[2])) return 0; // Y02
-    if (!AxisTest( e1[1], -e1[0], fey, fex, v0[0], v0[1], v1[0], v1[1], boxHalfSize[0], boxHalfSize[2])) return 0; // Z0
+    if (!AxisTest( e1[1], -e1[0], fey, fex, v0[0], v0[1], v1[0], v1[1], boxHalfSize[0], boxHalfSize[1])) return 0; // Z0
 
     fex = fabs(e2[0]);
     fey = fabs(e2[1]);
@@ -4150,31 +3986,31 @@ void Volume::MarkOutsideSurface(const size_t i0,
     }
 }
 
-inline void WalkForward(int64_t start,
-                        int64_t end,
-                        VoxelValue* ptr,
-                        int64_t stride,
-                        int64_t maxDistance)
+// Marks up to maxDistance undefined voxels after (direction +1) or before (direction -1) the voxel at
+// index along one axis, stopping at the first defined voxel or the grid boundary. coordinate is the
+// voxel coordinate on that axis and axisCount the number of voxels along it. Addresses are formed
+// only for voxels inside the grid.
+inline void WalkAxis(VoxelValue* const data,
+                     int64_t index,
+                     int64_t coordinate,
+                     const int64_t axisCount,
+                     const int64_t stride,
+                     const int64_t direction,
+                     const int64_t maxDistance)
 {
-    for (int64_t i = start, count = 0;
-         count < maxDistance && i < end && *ptr == VoxelValue::PRIMITIVE_UNDEFINED;
-         ++i, ptr += stride, ++count)
+    for (int64_t count = 0; count < maxDistance; ++count)
     {
-        *ptr = VoxelValue::PRIMITIVE_OUTSIDE_SURFACE_TOWALK;
-    }
-}
-
-inline void WalkBackward(int64_t start,
-                         int64_t end,
-                         VoxelValue* ptr,
-                         int64_t stride,
-                         int64_t maxDistance)
-{
-    for (int64_t i = start, count = 0;
-         count < maxDistance && i >= end && *ptr == VoxelValue::PRIMITIVE_UNDEFINED;
-         --i, ptr -= stride, ++count)
-    {
-        *ptr = VoxelValue::PRIMITIVE_OUTSIDE_SURFACE_TOWALK;
+        coordinate += direction;
+        if ( coordinate < 0 || coordinate >= axisCount )
+        {
+            return;
+        }
+        index += direction * stride;
+        if ( data[index] != VoxelValue::PRIMITIVE_UNDEFINED )
+        {
+            return;
+        }
+        data[index] = VoxelValue::PRIMITIVE_OUTSIDE_SURFACE_TOWALK;
     }
 }
 
@@ -4189,13 +4025,13 @@ void Volume::FillOutsideSurface(VHACDCallbacks& callbacks)
     // The cache size required for the walk is roughly (4 * walkDistance * 64) since
     // the k direction doesn't count as it's walking byte per byte directly in a cache lines.
     // ~16k is required for a walk distance of 64 in each directions.
-    const size_t walkDistance = 64;
+    const int64_t walkDistance = 64;
 
-    // using the stride directly instead of calling GetVoxel for each iterations saves
-    // a lot of multiplications and pipeline stalls due to data dependencies on imul.
-    const size_t istride = &GetVoxel(1, 0, 0) - &GetVoxel(0, 0, 0);
-    const size_t jstride = &GetVoxel(0, 1, 0) - &GetVoxel(0, 0, 0);
-    const size_t kstride = &GetVoxel(0, 0, 1) - &GetVoxel(0, 0, 0);
+    // Strides of the GetVoxel layout. Walking by stride saves the index multiplications.
+    const int64_t kstride = 1;
+    const int64_t jstride = k0;
+    const int64_t istride = j0 * k0;
+    VoxelValue* const data = m_data.data();
 
     // It might seem counter intuitive to go over the whole voxel range multiple times
     // but since we do the run in memory order, it leaves us with far fewer cache misses
@@ -4225,14 +4061,15 @@ void Volume::FillOutsideSurface(VHACDCallbacks& callbacks)
                         // walk in each direction to mark other voxel that should be walked.
                         // this will generate a 3d pattern that will help the overall
                         // algorithm converge faster while remaining cache friendly.
-                        WalkForward(k + 1, k0, &voxel + kstride, kstride, walkDistance);
-                        WalkBackward(k - 1, 0, &voxel - kstride, kstride, walkDistance);
+                        const int64_t index = k + j * jstride + i * istride;
+                        WalkAxis(data, index, k, k0, kstride, 1, walkDistance);
+                        WalkAxis(data, index, k, k0, kstride, -1, walkDistance);
 
-                        WalkForward(j + 1, j0, &voxel + jstride, jstride, walkDistance);
-                        WalkBackward(j - 1, 0, &voxel - jstride, jstride, walkDistance);
+                        WalkAxis(data, index, j, j0, jstride, 1, walkDistance);
+                        WalkAxis(data, index, j, j0, jstride, -1, walkDistance);
 
-                        WalkForward(i + 1, i0, &voxel + istride, istride, walkDistance);
-                        WalkBackward(i - 1, 0, &voxel - istride, istride, walkDistance);
+                        WalkAxis(data, index, i, i0, istride, 1, walkDistance);
+                        WalkAxis(data, index, i, i0, istride, -1, walkDistance);
                     }
                 }
             }
@@ -4672,9 +4509,6 @@ void VoxelHull::ComputeConvexHull()
             m_convexHull->m_points = qh.GetVertices();
             m_convexHull->m_triangles = qh.GetIndices();
 
-            VHACD::ComputeCentroid(m_convexHull->m_points,
-                                   m_convexHull->m_triangles,
-                                   m_convexHull->m_center);
             m_convexHull->m_volume = VHACD::ComputeMeshVolume(m_convexHull->m_points,
                                                               m_convexHull->m_triangles);
         }
@@ -5479,10 +5313,6 @@ void VHACDImpl::PerformConvexDecomposition()
             VHACD::BoundsAABB b = VHACD::BoundsAABB(ch->m_points).Inflate(double(0.1));
             ch->mBmin = b.GetMin();
             ch->mBmax = b.GetMax();
-
-            ComputeCentroid(ch->m_points,
-                            ch->m_triangles,
-                            ch->m_center);
         }
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
                         100,
@@ -5784,9 +5614,6 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeReducedConvexHull(const Co
     VHACD::BoundsAABB b = VHACD::BoundsAABB(ret->m_points).Inflate(double(0.1));
     ret->mBmin = b.GetMin();
     ret->mBmax = b.GetMax();
-    ComputeCentroid(ret->m_points,
-                    ret->m_triangles,
-                    ret->m_center);
 
     ret->m_volume = ComputeConvexHullVolume(*ret);
 
@@ -5819,9 +5646,6 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeCombinedConvexHull(const C
     VHACD::BoundsAABB b = VHACD::BoundsAABB(qh.GetVertices()).Inflate(double(0.1));
     ret->mBmin = b.GetMin();
     ret->mBmax = b.GetMax();
-    ComputeCentroid(ret->m_points,
-                    ret->m_triangles,
-                    ret->m_center);
 
     // Return the convex hull
     return ret;
