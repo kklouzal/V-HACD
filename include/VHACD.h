@@ -352,33 +352,44 @@ public:
     public:
         IUserCallback*      m_callback{nullptr};            // Optional user provided callback interface for progress
         IUserLogger*        m_logger{nullptr};              // Optional user provided callback interface for log messages
-        uint32_t            m_maxConvexHulls{ 64 };         // The maximum number of convex hulls to produce
-        uint32_t            m_resolution{ 400000 };         // The voxel resolution to use
-        double              m_minimumVolumePercentErrorAllowed{ 1 }; // if the voxels are within 1% of the volume of the hull, we consider this a close enough approximation
-        uint32_t            m_maxRecursionDepth{ 10 };        // The maximum recursion depth
+        uint32_t            m_maxConvexHulls{ 64 };         // The maximum number of convex hulls to produce; at least 1
+        uint32_t            m_resolution{ 400000 };         // Voxel budget. The longest axis receives floor(1.5 * m_resolution^0.33) voxels (at least 32, at most 1021)
+        double              m_minimumVolumePercentErrorAllowed{ 1 }; // A piece stops splitting once its hull volume is within this percentage of its voxel volume; finite and >= 0
+        uint32_t            m_maxRecursionDepth{ 10 };      // Pieces at this split depth are not split again (the root is depth 0), so at most 2^depth pieces precede merging
         bool                m_shrinkWrap{true};             // Whether or not to shrinkwrap the voxel positions to the source mesh on output
         FillMode            m_fillMode{ FillMode::FLOOD_FILL }; // How to fill the interior of the voxelized mesh
-        uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull
-        uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
+        uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull; at least 4
+        uint32_t            m_minEdgeLength{ 2 };           // A piece whose voxel extent is at most this on all 3 axes is not split again
+    };
+
+    /**
+    * Outcome of Compute.
+    */
+    enum class ComputeResult
+    {
+        Completed,    // Decomposition finished; GetNConvexHulls is zero only when no voxel was produced
+        Canceled,     // Cancel was requested while Compute ran; no hulls are available
+        InvalidInput, // The mesh or parameters violate the Compute contract; the reason goes to IUserLogger
     };
 
     /**
     * Requests that a running Compute stop early. It may be called from any thread, including
-    * from IUserCallback::Update. The interrupted Compute returns false and produces no hulls.
+    * from IUserCallback::Update. The interrupted Compute returns ComputeResult::Canceled.
+    * A request made before Compute starts is discarded.
     */
     virtual void Cancel() = 0;
 
     /**
     * Compute a convex decomposition of a triangle mesh using float vertices and the provided user parameters.
     *
-    * @param points : The vertices of the source mesh as floats in the form of X1,Y1,Z1,  X2,Y2,Z2,.. etc.
+    * @param points : countPoints * 3 finite coordinates in the form X1,Y1,Z1, X2,Y2,Z2, ...; may be null only when countPoints is 0
     * @param countPoints : The number of vertices in the source mesh.
-    * @param triangles : The indices of triangles in the source mesh in the form of I1,I2,I3, ....
+    * @param triangles : countTriangles * 3 vertex indices, each below countPoints; may be null only when countTriangles is 0
     * @param countTriangles : The number of triangles in the source mesh
     * @param params : The convex decomposition parameters to apply
-    * @return : Returns true when the decomposition ran to completion; false when it was canceled
+    * @return : Completed, Canceled, or InvalidInput. Previous results are released in every case.
     */
-    virtual bool Compute(const float* const points,
+    virtual ComputeResult Compute(const float* const points,
                          const uint32_t countPoints,
                          const uint32_t* const triangles,
                          const uint32_t countTriangles,
@@ -387,14 +398,14 @@ public:
     /**
     * Compute a convex decomposition of a triangle mesh using double vertices and the provided user parameters.
     *
-    * @param points : The vertices of the source mesh as floats in the form of X1,Y1,Z1,  X2,Y2,Z2,.. etc.
+    * @param points : countPoints * 3 finite coordinates in the form X1,Y1,Z1, X2,Y2,Z2, ...; may be null only when countPoints is 0
     * @param countPoints : The number of vertices in the source mesh.
-    * @param triangles : The indices of triangles in the source mesh in the form of I1,I2,I3, ....
+    * @param triangles : countTriangles * 3 vertex indices, each below countPoints; may be null only when countTriangles is 0
     * @param countTriangles : The number of triangles in the source mesh
     * @param params : The convex decomposition parameters to apply
-    * @return : Returns true when the decomposition ran to completion; false when it was canceled
+    * @return : Completed, Canceled, or InvalidInput. Previous results are released in every case.
     */
-    virtual bool Compute(const double* const points,
+    virtual ComputeResult Compute(const double* const points,
                          const uint32_t countPoints,
                          const uint32_t* const triangles,
                          const uint32_t countTriangles,
@@ -4154,15 +4165,26 @@ bool TriBoxOverlap(const VHACD::Vect3& boxCenter,
     return true; /* box and triangle overlaps */
 }
 
+// Voxels along the longest axis for a requested resolution. The other axes receive at most two more.
+inline size_t VoxelDimensionForResolution(const size_t resolution)
+{
+    size_t dim = size_t(std::pow(double(resolution), 0.33) * double(1.5));
+    return std::max(dim, size_t(32));
+}
+
+// Voxel coordinates and the voxel corner coordinates hulls are built from are packed into 10 bits
+// each (Voxel, VoxelHull::GetVertexIndex). A corner coordinate reaches the axis voxel count, which is
+// at most the longest-axis count plus two, so that count must stay below 1022.
+constexpr size_t MaxVoxelDimension = 1021;
+
 void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                       const std::vector<VHACD::Triangle>& indices,
                       const size_t dimensions,
                       FillMode fillMode,
                       const AABBTree& aabbTree)
 {
-    double a = std::pow(dimensions, 0.33);
-    size_t dim = a * double(1.5);
-    dim = std::max(dim, size_t(32));
+    const size_t dim = VoxelDimensionForResolution(dimensions);
+    assert(dim <= MaxVoxelDimension);
 
     if (points.size() == 0)
     {
@@ -5041,7 +5063,7 @@ bool VoxelHull::IsComplete()
     {
         ret = true;
     }
-    else if ( m_depth > m_params.m_maxRecursionDepth )
+    else if ( m_depth >= m_params.m_maxRecursionDepth )
     {
         ret = true;
     }
@@ -5126,18 +5148,26 @@ SplitAxis VoxelHull::ComputeSplitPlane(uint32_t& location)
 {
     const VHACD::Vector3<uint32_t> d = m_2 - m_1;
 
+    // Voxels at or below location go to the negative side, so location must stay below the region
+    // maximum or the positive side is empty. The midpoint formula reaches the maximum only for an
+    // extent of 1, which IsComplete already rules out whenever m_minEdgeLength >= 1.
+    uint32_t axis = 2;
+    SplitAxis ret = SplitAxis::Z_AXIS_NEGATIVE;
     if ( d.GetX() >= d.GetY() && d.GetX() >= d.GetZ() )
     {
-        location = (m_2.GetX() + 1 + m_1.GetX()) / 2;
-        return SplitAxis::X_AXIS_NEGATIVE;
+        axis = 0;
+        ret = SplitAxis::X_AXIS_NEGATIVE;
     }
-    if ( d.GetY() >= d.GetX() && d.GetY() >= d.GetZ() )
+    else if ( d.GetY() >= d.GetX() && d.GetY() >= d.GetZ() )
     {
-        location = (m_2.GetY() + 1 + m_1.GetY()) / 2;
-        return SplitAxis::Y_AXIS_NEGATIVE;
+        axis = 1;
+        ret = SplitAxis::Y_AXIS_NEGATIVE;
     }
-    location = (m_2.GetZ() + 1 + m_1.GetZ()) / 2;
-    return SplitAxis::Z_AXIS_NEGATIVE;
+    // IsComplete returns true when every extent is at most m_minEdgeLength, so the split axis spans at
+    // least two voxels here.
+    assert(d[axis] >= 1);
+    location = std::min((m_2[axis] + 1 + m_1[axis]) / 2, m_2[axis] - 1);
+    return ret;
 }
 
 void VoxelHull::PerformPlaneSplit()
@@ -5240,17 +5270,17 @@ public:
 
     void Cancel() override final;
 
-    bool Compute(const float* const points,
-                 const uint32_t countPoints,
-                 const uint32_t* const triangles,
-                 const uint32_t countTriangles,
-                 const Parameters& params) override final;
+    ComputeResult Compute(const float* const points,
+                          const uint32_t countPoints,
+                          const uint32_t* const triangles,
+                          const uint32_t countTriangles,
+                          const Parameters& params) override final;
 
-    bool Compute(const double* const points,
-                 const uint32_t countPoints,
-                 const uint32_t* const triangles,
-                 const uint32_t countTriangles,
-                 const Parameters& params) override final;
+    ComputeResult Compute(const double* const points,
+                          const uint32_t countPoints,
+                          const uint32_t* const triangles,
+                          const uint32_t countTriangles,
+                          const Parameters& params) override final;
 
     uint32_t GetNConvexHulls() const override final;
 
@@ -5262,9 +5292,26 @@ public:
     void Release() override final;
 
 // private:
-    bool Compute(const std::vector<VHACD::Vertex>& points,
-                 const std::vector<VHACD::Triangle>& triangles,
-                 const Parameters& params);
+    // Validates the caller's arrays and parameters, copies the mesh, and decomposes it
+    template <typename Coordinate>
+    ComputeResult ComputeFromArrays(const Coordinate* const points,
+                                    const uint32_t countPoints,
+                                    const uint32_t* const triangles,
+                                    const uint32_t countTriangles,
+                                    const Parameters& params);
+
+    // Returns nullptr when the input satisfies the Compute contract, otherwise the violated rule
+    template <typename Coordinate>
+    static const char* ValidateInput(const Coordinate* const points,
+                                     const uint32_t countPoints,
+                                     const uint32_t* const triangles,
+                                     const uint32_t countTriangles,
+                                     const Parameters& params);
+
+    // Decomposes a validated mesh; the caller has released previous results
+    ComputeResult Compute(const std::vector<VHACD::Vertex>& points,
+                          const std::vector<VHACD::Triangle>& triangles,
+                          const Parameters& params);
 
     // Take the source position, normalize it, and then convert it into an index position
     uint32_t GetIndex(VHACD::VertexIndex& vi,
@@ -5360,42 +5407,92 @@ void VHACDImpl::Cancel()
     m_canceled = true;
 }
 
-bool VHACDImpl::Compute(const float* const points,
-                        const uint32_t countPoints,
-                        const uint32_t* const triangles,
-                        const uint32_t countTriangles,
-                        const Parameters& params)
+IVHACD::ComputeResult VHACDImpl::Compute(const float* const points,
+                                         const uint32_t countPoints,
+                                         const uint32_t* const triangles,
+                                         const uint32_t countTriangles,
+                                         const Parameters& params)
 {
-    std::vector<VHACD::Vertex> v;
-    v.reserve(countPoints);
-    for (uint32_t i = 0; i < countPoints; ++i)
-    {
-        v.emplace_back(points[i * 3 + 0],
-                       points[i * 3 + 1],
-                       points[i * 3 + 2]);
-    }
-
-    std::vector<VHACD::Triangle> t;
-    t.reserve(countTriangles);
-    for (uint32_t i = 0; i < countTriangles; ++i)
-    {
-        t.emplace_back(triangles[i * 3 + 0],
-                       triangles[i * 3 + 1],
-                       triangles[i * 3 + 2]);
-    }
-
-    return Compute(v, t, params);
+    return ComputeFromArrays(points, countPoints, triangles, countTriangles, params);
 }
 
-bool VHACDImpl::Compute(const double* const points,
-                        const uint32_t countPoints,
-                        const uint32_t* const triangles,
-                        const uint32_t countTriangles,
-                        const Parameters& params)
+IVHACD::ComputeResult VHACDImpl::Compute(const double* const points,
+                                         const uint32_t countPoints,
+                                         const uint32_t* const triangles,
+                                         const uint32_t countTriangles,
+                                         const Parameters& params)
 {
+    return ComputeFromArrays(points, countPoints, triangles, countTriangles, params);
+}
+
+template <typename Coordinate>
+const char* VHACDImpl::ValidateInput(const Coordinate* const points,
+                                     const uint32_t countPoints,
+                                     const uint32_t* const triangles,
+                                     const uint32_t countTriangles,
+                                     const Parameters& params)
+{
+    if ( params.m_maxConvexHulls == 0 )
+    {
+        return "m_maxConvexHulls must be at least 1";
+    }
+    if ( params.m_maxNumVerticesPerCH < 4 )
+    {
+        return "m_maxNumVerticesPerCH must be at least 4";
+    }
+    if ( !std::isfinite(params.m_minimumVolumePercentErrorAllowed) || params.m_minimumVolumePercentErrorAllowed < 0 )
+    {
+        return "m_minimumVolumePercentErrorAllowed must be finite and non-negative";
+    }
+    if ( VoxelDimensionForResolution(params.m_resolution) > MaxVoxelDimension )
+    {
+        return "m_resolution produces more than 1021 voxels along the longest axis";
+    }
+    if ( (countPoints != 0 && points == nullptr) || (countTriangles != 0 && triangles == nullptr) )
+    {
+        return "a non-empty point or triangle array is null";
+    }
+    const size_t coordinateCount = size_t(countPoints) * 3;
+    for (size_t i = 0; i < coordinateCount; ++i)
+    {
+        if ( !std::isfinite(points[i]) )
+        {
+            return "a point coordinate is not finite";
+        }
+    }
+    const size_t indexCount = size_t(countTriangles) * 3;
+    for (size_t i = 0; i < indexCount; ++i)
+    {
+        if ( triangles[i] >= countPoints )
+        {
+            return "a triangle index is not below countPoints";
+        }
+    }
+    return nullptr;
+}
+
+template <typename Coordinate>
+IVHACD::ComputeResult VHACDImpl::ComputeFromArrays(const Coordinate* const points,
+                                                   const uint32_t countPoints,
+                                                   const uint32_t* const triangles,
+                                                   const uint32_t countTriangles,
+                                                   const Parameters& params)
+{
+    Clean(); // release any previous results
+    if ( const char* const violation = ValidateInput(points, countPoints, triangles, countTriangles, params) )
+    {
+        if ( params.m_logger )
+        {
+            char scratch[256];
+            snprintf(scratch, sizeof(scratch), "VHACD input rejected: %s", violation);
+            params.m_logger->Log(scratch);
+        }
+        return ComputeResult::InvalidInput;
+    }
+
     std::vector<VHACD::Vertex> v;
     v.reserve(countPoints);
-    for (uint32_t i = 0; i < countPoints; ++i)
+    for (size_t i = 0; i < countPoints; ++i)
     {
         v.emplace_back(points[i * 3 + 0],
                        points[i * 3 + 1],
@@ -5404,7 +5501,7 @@ bool VHACDImpl::Compute(const double* const points,
 
     std::vector<VHACD::Triangle> t;
     t.reserve(countTriangles);
-    for (uint32_t i = 0; i < countTriangles; ++i)
+    for (size_t i = 0; i < countTriangles; ++i)
     {
         t.emplace_back(triangles[i * 3 + 0],
                        triangles[i * 3 + 1],
@@ -5454,16 +5551,13 @@ void VHACDImpl::Release()
     delete this;
 }
 
-bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
-                        const std::vector<VHACD::Triangle>& triangles,
-                        const Parameters& params)
+IVHACD::ComputeResult VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
+                                         const std::vector<VHACD::Triangle>& triangles,
+                                         const Parameters& params)
 {
-    bool ret = false;
-
     m_params = params;
     m_canceled = false;
 
-    Clean(); // release any previous results
     CopyInputMesh(points,
                   triangles);
     if ( !m_canceled )
@@ -5475,17 +5569,13 @@ bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
     if ( m_canceled )
     {
         Clean();
-        ret = false;
         if ( m_params.m_logger )
         {
             m_params.m_logger->Log("VHACD operation canceled before it was complete.");
         }
+        return ComputeResult::Canceled;
     }
-    else
-    {
-        ret = true;
-    }
-    return ret;
+    return ComputeResult::Completed;
 }
 
 uint32_t VHACDImpl::GetIndex(VHACD::VertexIndex& vi,

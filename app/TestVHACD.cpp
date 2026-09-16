@@ -340,13 +340,13 @@ int main(int argc,const char **argv)
 			{
 				points[i] = w.mVertices[i];
 			}
-			bool canceled = false;
+			bool completed = false;
 			{
 				ScopedTime st("Computing Convex Decomposition");
-				canceled = !iface->Compute(points,w.mVertexCount,w.mIndices,w.mTriCount,p);
+				completed = iface->Compute(points,w.mVertexCount,w.mIndices,w.mTriCount,p) == VHACD::IVHACD::ComputeResult::Completed;
 				logging.flushMessages();
 			}
-			if ( !canceled && iface->GetNConvexHulls() )
+			if ( completed && iface->GetNConvexHulls() )
 			{
 				const char *fname = argv[1];
 				const char *dot = lastDot(fname);
