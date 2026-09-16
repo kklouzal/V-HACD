@@ -170,7 +170,6 @@ public:
     * Normalize and norming
     */
     T Normalize();
-    Vector3 Normalized();
     T GetNorm() const;
     T GetNormSquared() const;
     int LongestAxis() const;
@@ -207,8 +206,6 @@ public:
     /*
     * Comparison operators
     */
-    bool operator<(const Vector3& rhs) const;
-    bool operator>(const Vector3& rhs) const;
 
     /*
      * Returns true if all elements of *this are greater than or equal to all elements of rhs, coefficient wise
@@ -219,10 +216,8 @@ public:
 
     Vector3 CWiseMin(const Vector3& rhs) const;
     Vector3 CWiseMax(const Vector3& rhs) const;
-    T MinCoeff() const;
     T MaxCoeff() const;
 
-    T MinCoeff(uint32_t& idx) const;
     T MaxCoeff(uint32_t& idx) const;
 
     /*
@@ -259,7 +254,6 @@ struct BoundsAABB
 
     bool Intersects(const BoundsAABB& b) const;
 
-    double SurfaceArea() const;
     double Volume() const;
 
     BoundsAABB Inflate(double ratio) const;
@@ -272,7 +266,6 @@ struct BoundsAABB
     const VHACD::Vect3& GetMax() const;
 
     VHACD::Vect3 GetSize() const;
-    VHACD::Vect3 GetCenter() const;
 
     VHACD::Vect3 m_min{ double(0.0) };
     VHACD::Vect3 m_max{ double(0.0) };
@@ -520,15 +513,6 @@ protected:
     }
 
     template <typename T>
-    inline Vector3<T> Vector3<T>::Normalized()
-    {
-        Vector3<T> ret = *this;
-        T n = GetNorm();
-        if (n != T(0.0)) ret /= n;
-        return ret;
-    }
-
-    template <typename T>
     inline T Vector3<T>::GetNorm() const
     {
         return std::sqrt(GetNormSquared());
@@ -695,34 +679,6 @@ protected:
  * Comparison operators
  */
     template <typename T>
-    inline bool Vector3<T>::operator<(const Vector3<T>& rhs) const
-    {
-        if (GetX() == rhs.GetX())
-        {
-            if (GetY() == rhs.GetY())
-            {
-                return (GetZ() < rhs.GetZ());
-            }
-            return (GetY() < rhs.GetY());
-        }
-        return (GetX() < rhs.GetX());
-    }
-
-    template <typename T>
-    inline bool Vector3<T>::operator>(const Vector3<T>& rhs) const
-    {
-        if (GetX() == rhs.GetX())
-        {
-            if (GetY() == rhs.GetY())
-            {
-                return (GetZ() > rhs.GetZ());
-            }
-            return (GetY() > rhs.GetY());
-        }
-        return (GetX() > rhs.GetZ());
-    }
-
-    template <typename T>
     inline bool Vector3<T>::CWiseAllGE(const Vector3<T>& rhs) const
     {
         return    GetX() >= rhs.GetX()
@@ -755,23 +711,9 @@ protected:
     }
 
     template <typename T>
-    inline T Vector3<T>::MinCoeff() const
-    {
-        return *std::min_element(m_data.begin(), m_data.end());
-    }
-
-    template <typename T>
     inline T Vector3<T>::MaxCoeff() const
     {
         return *std::max_element(m_data.begin(), m_data.end());
-    }
-
-    template <typename T>
-    inline T Vector3<T>::MinCoeff(uint32_t& idx) const
-    {
-        auto it = std::min_element(m_data.begin(), m_data.end());
-        idx = uint32_t(std::distance(m_data.begin(), it));
-        return *it;
     }
 
     template <typename T>
@@ -972,12 +914,6 @@ bool VHACD::BoundsAABB::Intersects(const VHACD::BoundsAABB& b) const
     return true;
 }
 
-double BoundsAABB::SurfaceArea() const
-{
-    VHACD::Vect3 d = GetMax() - GetMin();
-    return double(2.0) * (d.GetX() * d.GetY() + d.GetX() * d.GetZ() + d.GetY() * d.GetZ());
-}
-
 double VHACD::BoundsAABB::Volume() const
 {
     VHACD::Vect3 d = GetMax() - GetMin();
@@ -1019,11 +955,6 @@ const VHACD::Vect3& VHACD::BoundsAABB::GetMax() const
 VHACD::Vect3 VHACD::BoundsAABB::GetSize() const
 {
     return GetMax() - GetMin();
-}
-
-VHACD::Vect3 VHACD::BoundsAABB::GetCenter() const
-{
-    return (GetMin() + GetMax()) * double(0.5);
 }
 
 /*
@@ -1293,7 +1224,6 @@ public:
 
     T& GetFirstNode();
 
-    void Clear();
 };
 
 template <typename T, std::size_t MaxBundleSize>
@@ -1331,12 +1261,6 @@ T& NodeBundle<T, MaxBundleSize>::GetFirstNode()
 {
     assert(m_head != m_list.end());
     return m_list.front().m_nodes[0];
-}
-
-template <typename T, std::size_t MaxBundleSize>
-void NodeBundle<T, MaxBundleSize>::Clear()
-{
-    m_list.clear();
 }
 
 /*
@@ -1382,24 +1306,12 @@ public:
     Googol operator+(const Googol &A) const;
     Googol operator-(const Googol &A) const;
     Googol operator*(const Googol &A) const;
-    Googol operator/ (const Googol &A) const;
 
     Googol& operator+= (const Googol &A);
     Googol& operator-= (const Googol &A);
 
-    bool operator>(const Googol &A) const;
-    bool operator>=(const Googol &A) const;
-    bool operator<(const Googol &A) const;
-    bool operator<=(const Googol &A) const;
-    bool operator==(const Googol &A) const;
-    bool operator!=(const Googol &A) const;
 
-    Googol Abs() const;
-    Googol Floor() const;
-    Googol InvSqrt() const;
-    Googol Sqrt() const;
 
-    void ToString(char* const string) const;
 
 private:
     void NegateMantissa(std::array<uint64_t, VHACD_GOOGOL_SIZE>& mantissa) const;
@@ -1420,20 +1332,7 @@ private:
     int m_sign{ 0 };
     int m_exponent{ 0 };
     std::array<uint64_t, VHACD_GOOGOL_SIZE> m_mantissa{ 0 };
-
-public:
-    static Googol m_zero;
-    static Googol m_one;
-    static Googol m_two;
-    static Googol m_three;
-    static Googol m_half;
 };
-
-Googol Googol::m_zero(double(0.0));
-Googol Googol::m_one(double(1.0));
-Googol Googol::m_two(double(2.0));
-Googol Googol::m_three(double(3.0));
-Googol Googol::m_half(double(0.5));
 
 Googol::Googol(double value)
 {
@@ -1578,23 +1477,6 @@ Googol Googol::operator*(const Googol &A) const
     return Googol(double(0.0));
 }
 
-Googol Googol::operator/(const Googol &A) const
-{
-    Googol tmp(double(1.0) / A);
-    tmp = tmp * (m_two - A * tmp);
-    tmp = tmp * (m_two - A * tmp);
-    bool test = false;
-    int passes = 0;
-    do
-    {
-        passes++;
-        Googol tmp0(tmp);
-        tmp = tmp * (m_two - A * tmp);
-        test = tmp0 == tmp;
-    } while (test && (passes < (2 * VHACD_GOOGOL_SIZE)));
-    return (*this) * tmp;
-}
-
 Googol& Googol::operator+=(const Googol &A)
 {
     *this = *this + A;
@@ -1605,120 +1487,6 @@ Googol& Googol::operator-=(const Googol &A)
 {
     *this = *this - A;
     return *this;
-}
-
-bool Googol::operator>(const Googol &A) const
-{
-    Googol tmp(*this - A);
-    return double(tmp) > double(0.0);
-}
-
-bool Googol::operator>=(const Googol &A) const
-{
-    Googol tmp(*this - A);
-    return double(tmp) >= double(0.0);
-}
-
-bool Googol::operator<(const Googol &A) const
-{
-    Googol tmp(*this - A);
-    return double(tmp) < double(0.0);
-}
-
-bool Googol::operator<=(const Googol &A) const
-{
-    Googol tmp(*this - A);
-    return double(tmp) <= double(0.0);
-}
-
-bool Googol::operator==(const Googol &A) const
-{
-    return    m_sign == A.m_sign
-           && m_exponent == A.m_exponent
-           && m_mantissa == A.m_mantissa;
-}
-
-bool Googol::operator!=(const Googol &A) const
-{
-    return !(*this == A);
-}
-
-Googol Googol::Abs() const
-{
-    Googol tmp(*this);
-    tmp.m_sign = 0;
-    return tmp;
-}
-
-Googol Googol::Floor() const
-{
-    if (m_exponent < 1)
-    {
-        return Googol(double(0.0));
-    }
-    int bits = m_exponent + 2;
-    int start = 0;
-    while (bits >= 64)
-    {
-        bits -= 64;
-        start++;
-    }
-
-    Googol tmp(*this);
-    for (int i = VHACD_GOOGOL_SIZE - 1; i > start; i--)
-    {
-        tmp.m_mantissa[i] = 0;
-    }
-    // some compilers do no like this and I do not know why is that
-    //uint64_t mask = (-1LL) << (64 - bits);
-    uint64_t mask(~0ULL);
-    mask <<= (64 - bits);
-    tmp.m_mantissa[start] &= mask;
-    return tmp;
-}
-
-Googol Googol::InvSqrt() const
-{
-    const Googol& me = *this;
-    Googol x(double(1.0) / sqrt(me));
-
-    int test = 0;
-    int passes = 0;
-    do
-    {
-        passes++;
-        Googol tmp(x);
-        x = m_half * x * (m_three - me * x * x);
-        test = (x != tmp);
-    } while (test && (passes < (2 * VHACD_GOOGOL_SIZE)));
-    return x;
-}
-
-Googol Googol::Sqrt() const
-{
-    return *this * InvSqrt();
-}
-
-void Googol::ToString(char* const string) const
-{
-    Googol tmp(*this);
-    Googol base(double(10.0));
-    while (double(tmp) > double(1.0))
-    {
-        tmp = tmp / base;
-    }
-
-    int index = 0;
-    while (tmp.m_mantissa[0])
-    {
-        tmp = tmp * base;
-        Googol digit(tmp.Floor());
-        tmp -= digit;
-        double val = digit;
-        string[index] = char(val) + '0';
-        index++;
-    }
-    string[index] = 0;
 }
 
 void Googol::NegateMantissa(std::array<uint64_t, VHACD_GOOGOL_SIZE>& mantissa) const
@@ -1931,10 +1699,6 @@ class HullPlane : public VHACD::Vect3
 {
 public:
     HullPlane(const HullPlane&) = default;
-    HullPlane(double x,
-              double y,
-              double z,
-              double w);
 
     HullPlane(const VHACD::Vect3& p,
               double w);
@@ -1950,20 +1714,10 @@ public:
     double Evalue(const VHACD::Vect3 &point) const;
 
     double& GetW();
-    const double& GetW() const;
 
 private:
     double m_w;
 };
-
-HullPlane::HullPlane(double x,
-                     double y,
-                     double z,
-                     double w)
-    : VHACD::Vect3(x, y, z)
-    , m_w(w)
-{
-}
 
 HullPlane::HullPlane(const VHACD::Vect3& p,
                      double w)
@@ -2001,11 +1755,6 @@ double HullPlane::Evalue(const VHACD::Vect3& point) const
 }
 
 double& HullPlane::GetW()
-{
-    return m_w;
-}
-
-const double& HullPlane::GetW() const
 {
     return m_w;
 }
@@ -2095,7 +1844,6 @@ class ConvexHullAABBTreeNode
     #define VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE 8
 public:
     ConvexHullAABBTreeNode() = default;
-    ConvexHullAABBTreeNode(ConvexHullAABBTreeNode* parent);
 
     VHACD::Vect3 m_box[2];
     ConvexHullAABBTreeNode* m_left{ nullptr };
@@ -2106,17 +1854,11 @@ public:
     std::array<size_t, VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE> m_indices;
 };
 
-ConvexHullAABBTreeNode::ConvexHullAABBTreeNode(ConvexHullAABBTreeNode* parent)
-    : m_parent(parent)
-{
-}
-
 class ConvexHull
 {
     class ndNormalMap;
 
 public:
-    ConvexHull(const ConvexHull& source);
     ConvexHull(const std::vector<::VHACD::Vertex>& vertexCloud,
                double distTol,
                int maxVertexCount = 0x7fffffff);
@@ -2135,8 +1877,6 @@ private:
     int InitVertexArray(std::vector<ConvexHullVertex>& points,
                         NodeBundle<ConvexHullAABBTreeNode>& memoryPool);
 
-    ConvexHullAABBTreeNode* BuildTreeNew(std::vector<ConvexHullVertex>& points,
-                                         std::vector<ConvexHullAABBTreeNode>& memoryPool) const;
     ConvexHullAABBTreeNode* BuildTreeOld(std::vector<ConvexHullVertex>& points,
                                          NodeBundle<ConvexHullAABBTreeNode>& memoryPool);
     ConvexHullAABBTreeNode* BuildTreeRecurse(ConvexHullAABBTreeNode* const parent,
@@ -2165,8 +1905,6 @@ private:
                              const VHACD::Vect3& p3) const;
 
     std::list<ConvexHullFace> m_list;
-    VHACD::Vect3 m_aabbP0{ 0 };
-    VHACD::Vect3 m_aabbP1{ 0 };
     double m_diag{ 0.0 };
     std::vector<VHACD::Vect3> m_points;
 };
@@ -2499,390 +2237,6 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeOld(std::vector<ConvexHullVertex>& 
                             memoryPool);
 }
 
-ConvexHullAABBTreeNode* ConvexHull::BuildTreeNew(std::vector<ConvexHullVertex>& points,
-                                                 std::vector<ConvexHullAABBTreeNode>& memoryPool) const
-{
-    class dCluster
-    {
-        public:
-        VHACD::Vect3 m_sum{ double(0.0) };
-        VHACD::Vect3 m_sum2{ double(0.0) };
-        int m_start{ 0 };
-        int m_count{ 0 };
-    };
-
-    dCluster firstCluster;
-    firstCluster.m_count = int(points.size());
-
-    for (int i = 0; i < firstCluster.m_count; ++i)
-    {
-        const VHACD::Vect3& p = points[i];
-        firstCluster.m_sum += p;
-        firstCluster.m_sum2 += p.CWiseMul(p);
-    }
-
-    int baseCount = 0;
-    const int clusterSize = 16;
-
-    if (firstCluster.m_count > clusterSize)
-    {
-        dCluster spliteStack[128];
-        spliteStack[0] = firstCluster;
-        size_t stack = 1;
-
-        while (stack)
-        {
-            stack--;
-            dCluster cluster (spliteStack[stack]);
-
-            const VHACD::Vect3 origin(cluster.m_sum * (double(1.0) / cluster.m_count));
-            const VHACD::Vect3 variance2(cluster.m_sum2 * (double(1.0) / cluster.m_count) - origin.CWiseMul(origin));
-            double maxVariance2 = variance2.MaxCoeff();
-
-            if (   (cluster.m_count <= clusterSize)
-                || (stack > (sizeof(spliteStack) / sizeof(spliteStack[0]) - 4))
-                || (maxVariance2 < 1.e-4f))
-            {
-                // no sure if this is beneficial,
-                // the array is so small that seem too much overhead
-                //int maxIndex = 0;
-                //double min_x = 1.0e20f;
-                //for (int i = 0; i < cluster.m_count; ++i)
-                //{
-                //	if (points[cluster.m_start + i].getX() < min_x)
-                //	{
-                //		maxIndex = i;
-                //		min_x = points[cluster.m_start + i].getX();
-                //	}
-                //}
-                //Swap(points[cluster.m_start], points[cluster.m_start + maxIndex]);
-                //
-                //for (int i = 2; i < cluster.m_count; ++i)
-                //{
-                //	int j = i;
-                //	ConvexHullVertex tmp(points[cluster.m_start + i]);
-                //	for (; points[cluster.m_start + j - 1].getX() > tmp.getX(); --j)
-                //	{
-                //		assert(j > 0);
-                //		points[cluster.m_start + j] = points[cluster.m_start + j - 1];
-                //	}
-                //	points[cluster.m_start + j] = tmp;
-                //}
-
-                int count = cluster.m_count;
-                for (int i = cluster.m_count - 1; i > 0; --i)
-                {
-                    for (int j = i - 1; j >= 0; --j)
-                    {
-                        VHACD::Vect3 error(points[cluster.m_start + j] - points[cluster.m_start + i]);
-                        double mag2 = error.Dot(error);
-                        if (mag2 < double(1.0e-6))
-                        {
-                            points[cluster.m_start + j] = points[cluster.m_start + i];
-                            count--;
-                            break;
-                        }
-                    }
-                }
-
-                assert(baseCount <= cluster.m_start);
-                for (int i = 0; i < count; ++i)
-                {
-                    points[baseCount] = points[cluster.m_start + i];
-                    baseCount++;
-                }
-            }
-            else
-            {
-                const int firstSortAxis = variance2.LongestAxis();
-                double axisVal = origin[firstSortAxis];
-
-                int i0 = 0;
-                int i1 = cluster.m_count - 1;
-
-                const int start = cluster.m_start;
-                while (i0 < i1)
-                {
-                    while (   (points[start + i0][firstSortAxis] <= axisVal)
-                           && (i0 < i1))
-                    {
-                        ++i0;
-                    };
-
-                    while (   (points[start + i1][firstSortAxis] > axisVal)
-                           && (i0 < i1))
-                    {
-                        --i1;
-                    }
-
-                    assert(i0 <= i1);
-                    if (i0 < i1)
-                    {
-                        std::swap(points[start + i0],
-                                  points[start + i1]);
-                        ++i0;
-                        --i1;
-                    }
-                }
-
-                while (   (points[start + i0][firstSortAxis] <= axisVal)
-                       && (i0 < cluster.m_count))
-                {
-                    ++i0;
-                };
-
-                #ifdef _DEBUG
-                for (int i = 0; i < i0; ++i)
-                {
-                    assert(points[start + i][firstSortAxis] <= axisVal);
-                }
-
-                for (int i = i0; i < cluster.m_count; ++i)
-                {
-                    assert(points[start + i][firstSortAxis] > axisVal);
-                }
-                #endif
-
-                VHACD::Vect3 xc(0);
-                VHACD::Vect3 x2c(0);
-                for (int i = 0; i < i0; ++i)
-                {
-                    const VHACD::Vect3& x = points[start + i];
-                    xc += x;
-                    x2c += x.CWiseMul(x);
-                }
-
-                dCluster cluster_i1(cluster);
-                cluster_i1.m_start = start + i0;
-                cluster_i1.m_count = cluster.m_count - i0;
-                cluster_i1.m_sum -= xc;
-                cluster_i1.m_sum2 -= x2c;
-                spliteStack[stack] = cluster_i1;
-                assert(cluster_i1.m_count > 0);
-                stack++;
-
-                dCluster cluster_i0(cluster);
-                cluster_i0.m_start = start;
-                cluster_i0.m_count = i0;
-                cluster_i0.m_sum = xc;
-                cluster_i0.m_sum2 = x2c;
-                assert(cluster_i0.m_count > 0);
-                spliteStack[stack] = cluster_i0;
-                stack++;
-            }
-        }
-    }
-
-    points.resize(baseCount);
-    if (baseCount < 4)
-    {
-        return nullptr;
-    }
-
-    VHACD::Vect3 sum(0);
-    VHACD::Vect3 sum2(0);
-    VHACD::Vect3 minP(double( 1.0e15));
-    VHACD::Vect3 maxP(double(-1.0e15));
-    class dTreeBox
-    {
-        public:
-        VHACD::Vect3 m_min;
-        VHACD::Vect3 m_max;
-        VHACD::Vect3 m_sum;
-        VHACD::Vect3 m_sum2;
-        ConvexHullAABBTreeNode* m_parent;
-        ConvexHullAABBTreeNode** m_child;
-        int m_start;
-        int m_count;
-    };
-
-    for (int i = 0; i < baseCount; ++i)
-    {
-        const VHACD::Vect3& p = points[i];
-        sum += p;
-        sum2 += p.CWiseMul(p);
-        minP = minP.CWiseMin(p);
-        maxP = maxP.CWiseMax(p);
-    }
-
-    dTreeBox treeBoxStack[128];
-    treeBoxStack[0].m_start = 0;
-    treeBoxStack[0].m_count = baseCount;
-    treeBoxStack[0].m_sum = sum;
-    treeBoxStack[0].m_sum2 = sum2;
-    treeBoxStack[0].m_min = minP;
-    treeBoxStack[0].m_max = maxP;
-    treeBoxStack[0].m_child = nullptr;
-    treeBoxStack[0].m_parent = nullptr;
-
-    int stack = 1;
-    ConvexHullAABBTreeNode* root = nullptr;
-    while (stack)
-    {
-        stack--;
-        dTreeBox box(treeBoxStack[stack]);
-        if (box.m_count <= VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE)
-        {
-            assert(memoryPool.size() != memoryPool.capacity()
-                   && "memoryPool is going to be reallocated, pointers will be invalid");
-            memoryPool.emplace_back();
-            ConvexHullAABBTreeNode& clump = memoryPool.back();
-
-            clump.m_count = box.m_count;
-            for (int i = 0; i < box.m_count; ++i)
-            {
-                clump.m_indices[i] = i + box.m_start;
-            }
-            clump.m_box[0] = box.m_min;
-            clump.m_box[1] = box.m_max;
-
-            if (box.m_child)
-            {
-                *box.m_child = &clump;
-            }
-
-            if (!root)
-            {
-                root = &clump;
-            }
-        }
-        else
-        {
-            const VHACD::Vect3 origin(box.m_sum * (double(1.0) / box.m_count));
-            const VHACD::Vect3 variance2(box.m_sum2 * (double(1.0) / box.m_count) - origin.CWiseMul(origin));
-
-            int firstSortAxis = 0;
-            if ((variance2.GetY() >= variance2.GetX()) && (variance2.GetY() >= variance2.GetZ()))
-            {
-                firstSortAxis = 1;
-            }
-            else if ((variance2.GetZ() >= variance2.GetX()) && (variance2.GetZ() >= variance2.GetY()))
-            {
-                firstSortAxis = 2;
-            }
-            double axisVal = origin[firstSortAxis];
-
-            int i0 = 0;
-            int i1 = box.m_count - 1;
-
-            const int start = box.m_start;
-            while (i0 < i1)
-            {
-                while ((points[start + i0][firstSortAxis] <= axisVal) && (i0 < i1))
-                {
-                    ++i0;
-                };
-
-                while ((points[start + i1][firstSortAxis] > axisVal) && (i0 < i1))
-                {
-                    --i1;
-                }
-
-                assert(i0 <= i1);
-                if (i0 < i1)
-                {
-                    std::swap(points[start + i0],
-                              points[start + i1]);
-                    ++i0;
-                    --i1;
-                }
-            }
-
-            while ((points[start + i0][firstSortAxis] <= axisVal) && (i0 < box.m_count))
-            {
-                ++i0;
-            };
-
-            #ifdef _DEBUG
-            for (int i = 0; i < i0; ++i)
-            {
-                assert(points[start + i][firstSortAxis] <= axisVal);
-            }
-
-            for (int i = i0; i < box.m_count; ++i)
-            {
-                assert(points[start + i][firstSortAxis] > axisVal);
-            }
-            #endif
-
-            assert(memoryPool.size() != memoryPool.capacity()
-                   && "memoryPool is going to be reallocated, pointers will be invalid");
-            memoryPool.emplace_back();
-            ConvexHullAABBTreeNode& node = memoryPool.back();
-
-            node.m_box[0] = box.m_min;
-            node.m_box[1] = box.m_max;
-            if (box.m_child)
-            {
-                *box.m_child = &node;
-            }
-
-            if (!root)
-            {
-                root = &node;
-            }
-
-            {
-                VHACD::Vect3 xc(0);
-                VHACD::Vect3 x2c(0);
-                VHACD::Vect3 p0(double( 1.0e15));
-                VHACD::Vect3 p1(double(-1.0e15));
-                for (int i = i0; i < box.m_count; ++i)
-                {
-                    const VHACD::Vect3& p = points[start + i];
-                    xc += p;
-                    x2c += p.CWiseMul(p);
-                    p0 = p0.CWiseMin(p);
-                    p1 = p1.CWiseMax(p);
-                }
-
-                dTreeBox cluster_i1(box);
-                cluster_i1.m_start = start + i0;
-                cluster_i1.m_count = box.m_count - i0;
-                cluster_i1.m_sum = xc;
-                cluster_i1.m_sum2 = x2c;
-                cluster_i1.m_min = p0;
-                cluster_i1.m_max = p1;
-                cluster_i1.m_parent = &node;
-                cluster_i1.m_child = &node.m_right;
-                treeBoxStack[stack] = cluster_i1;
-                assert(cluster_i1.m_count > 0);
-                stack++;
-            }
-
-            {
-                VHACD::Vect3 xc(0);
-                VHACD::Vect3 x2c(0);
-                VHACD::Vect3 p0(double( 1.0e15));
-                VHACD::Vect3 p1(double(-1.0e15));
-                for (int i = 0; i < i0; ++i)
-                {
-                    const VHACD::Vect3& p = points[start + i];
-                    xc += p;
-                    x2c += p.CWiseMul(p);
-                    p0 = p0.CWiseMin(p);
-                    p1 = p1.CWiseMax(p);
-                }
-
-                dTreeBox cluster_i0(box);
-                cluster_i0.m_start = start;
-                cluster_i0.m_count = i0;
-                cluster_i0.m_min = p0;
-                cluster_i0.m_max = p1;
-                cluster_i0.m_sum = xc;
-                cluster_i0.m_sum2 = x2c;
-                cluster_i0.m_parent = &node;
-                cluster_i0.m_child = &node.m_left;
-                assert(cluster_i0.m_count > 0);
-                treeBoxStack[stack] = cluster_i0;
-                stack++;
-            }
-        }
-    }
-
-    return root;
-}
-
 int ConvexHull::SupportVertex(ConvexHullAABBTreeNode** const treePointer,
                               const std::vector<ConvexHullVertex>& points,
                               const VHACD::Vect3& dirPlane,
@@ -3033,14 +2387,9 @@ double ConvexHull::TetrahedrumVolume(const VHACD::Vect3& p0,
 
 int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
                                 NodeBundle<ConvexHullAABBTreeNode>& memoryPool)
-//                                 std::vector<ConvexHullAABBTreeNode>& memoryPool)
 {
-#if 1
     ConvexHullAABBTreeNode* tree = BuildTreeOld(points,
                                                 memoryPool);
-#else
-    ConvexHullAABBTreeNode* tree = BuildTreeNew(points, (char**)&memoryPool, maxMemSize);
-#endif
     int count = int(points.size());
     if (count < 4)
     {
@@ -3049,8 +2398,6 @@ int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
     }
 
     m_points.resize(count);
-    m_aabbP0 = tree->m_box[0];
-    m_aabbP1 = tree->m_box[1];
 
     VHACD::Vect3 boxSize(tree->m_box[1] - tree->m_box[0]);
     m_diag = boxSize.GetNorm();
@@ -3468,10 +2815,8 @@ public:
                         double radius,
                         bool& _found) const; // returns the nearest possible neighbor's index.
 
-    const std::vector<VHACD::Vertex>& GetVertices() const;
     std::vector<VHACD::Vertex>&& TakeVertices();
 
-    uint32_t GetVCount() const;
 
 private:
     KdTreeNode* m_root{ nullptr };
@@ -3567,19 +2912,9 @@ uint32_t KdTree::GetNearest(const VHACD::Vect3& pos,
     return ret;
 }
 
-const std::vector<VHACD::Vertex>& KdTree::GetVertices() const
-{
-    return m_vertices;
-}
-
 std::vector<VHACD::Vertex>&& KdTree::TakeVertices()
 {
     return std::move(m_vertices);
-}
-
-uint32_t KdTree::GetVCount() const
-{
-    return uint32_t(m_vertices.size());
 }
 
 KdTreeNode::KdTreeNode(uint32_t index)
@@ -3773,47 +3108,10 @@ public:
     uint32_t GetIndex(VHACD::Vect3 p,
                       bool& newPos);
 
-    const std::vector<VHACD::Vertex>& GetVertices() const;
 
     std::vector<VHACD::Vertex>&& TakeVertices();
 
-    uint32_t GetVCount() const;
 
-    bool SaveAsObj(const char* fname,
-                   uint32_t tcount,
-                   uint32_t* indices)
-    {
-        bool ret = false;
-
-        FILE* fph = fopen(fname, "wb");
-        if (fph)
-        {
-            ret = true;
-
-            const std::vector<VHACD::Vertex>& v = GetVertices();
-            for (uint32_t i = 0; i < v.size(); ++i)
-            {
-                fprintf(fph, "v %0.9f %0.9f %0.9f\r\n",
-                        v[i].mX,
-                        v[i].mY,
-                        v[i].mZ);
-            }
-
-            for (uint32_t i = 0; i < tcount; i++)
-            {
-                uint32_t i1 = *indices++;
-                uint32_t i2 = *indices++;
-                uint32_t i3 = *indices++;
-                fprintf(fph, "f %d %d %d\r\n",
-                        i1 + 1,
-                        i2 + 1,
-                        i3 + 1);
-            }
-            fclose(fph);
-        }
-
-        return ret;
-    }
 
 private:
     bool m_snapToGrid : 1;
@@ -3861,19 +3159,9 @@ uint32_t VertexIndex::GetIndex(VHACD::Vect3 p,
     return ret;
 }
 
-const std::vector<VHACD::Vertex>& VertexIndex::GetVertices() const
-{
-    return m_KdTree.GetVertices();
-}
-
 std::vector<VHACD::Vertex>&& VertexIndex::TakeVertices()
 {
     return std::move(m_KdTree.TakeVertices());
-}
-
-uint32_t VertexIndex::GetVCount() const
-{
-    return m_KdTree.GetVCount();
 }
 
 /*
@@ -3891,15 +3179,12 @@ class Voxel
     static constexpr int VoxelBitsXStart = 20;
     static constexpr int VoxelBitMask = 0x03FF; // bits 0 through 9 inclusive
 public:
-    Voxel() = default;
 
-    Voxel(uint32_t index);
 
     Voxel(uint32_t x,
           uint32_t y,
           uint32_t z);
 
-    bool operator==(const Voxel &v) const;
 
     VHACD::Vector3<uint32_t> GetVoxel() const;
 
@@ -3907,16 +3192,10 @@ public:
     uint32_t GetY() const;
     uint32_t GetZ() const;
 
-    uint32_t GetVoxelAddress() const;
 
 private:
     uint32_t m_voxel{ 0 };
 };
-
-Voxel::Voxel(uint32_t index)
-    : m_voxel(index)
-{
-}
 
 Voxel::Voxel(uint32_t x,
              uint32_t y,
@@ -3926,11 +3205,6 @@ Voxel::Voxel(uint32_t x,
     assert(x < 1024 && "Voxel constructed with X outside of range");
     assert(y < 1024 && "Voxel constructed with Y outside of range");
     assert(z < 1024 && "Voxel constructed with Z outside of range");
-}
-
-bool Voxel::operator==(const Voxel& v) const
-{
-    return m_voxel == v.m_voxel;
 }
 
 VHACD::Vector3<uint32_t> Voxel::GetVoxel() const
@@ -3951,11 +3225,6 @@ uint32_t Voxel::GetY() const
 uint32_t Voxel::GetZ() const
 {
     return (m_voxel >> VoxelBitsZStart) & VoxelBitMask;
-}
-
-uint32_t Voxel::GetVoxelAddress() const
-{
-    return m_voxel;
 }
 
 struct SimpleMesh
@@ -4166,17 +3435,10 @@ class AABBTree
 {
 public:
     AABBTree() = default;
-    AABBTree(AABBTree&&) = default;
     AABBTree& operator=(AABBTree&&) = default;
 
     AABBTree(const std::vector<VHACD::Vertex>& vertices,
              const std::vector<VHACD::Triangle>& indices);
-
-    bool TraceRay(const VHACD::Vect3& start,
-                  const VHACD::Vect3& to,
-                  double& outT,
-                  double& faceSign,
-                  VHACD::Vect3& hitLocation) const;
 
     bool TraceRay(const VHACD::Vect3& start,
                   const VHACD::Vect3& dir,
@@ -4192,9 +3454,6 @@ public:
                   double& faceSign,
                   uint32_t& faceIndex) const;
 
-    VHACD::Vect3 GetCenter() const;
-    VHACD::Vect3 GetMinExtents() const;
-    VHACD::Vect3 GetMaxExtents() const;
 
     bool GetClosestPointWithinDistance(const VHACD::Vect3& point,
                                        double maxDistance,
@@ -4232,9 +3491,6 @@ private:
     uint32_t PartitionMedian(Node& n,
                              uint32_t* faces,
                              uint32_t numFaces);
-    uint32_t PartitionSAH(Node& n,
-                          uint32_t* faces,
-                          uint32_t numFaces);
 
     void Build();
 
@@ -4280,14 +3536,8 @@ private:
 
     std::vector<uint32_t> m_faces;
     std::vector<Node> m_nodes;
-    std::vector<VHACD::BoundsAABB> m_faceBounds;
 
-    // stats
-    uint32_t m_treeDepth{ 0 };
-    uint32_t m_innerNodes{ 0 };
-    uint32_t m_leafNodes{ 0 };
 
-    uint32_t s_depth{ 0 };
 };
 
 AABBTree::FaceSorter::FaceSorter(const std::vector<VHACD::Vertex>& positions,
@@ -4330,36 +3580,6 @@ AABBTree::AABBTree(const std::vector<VHACD::Vertex>& vertices,
     , m_indices(&indices)
 {
     Build();
-}
-
-bool AABBTree::TraceRay(const VHACD::Vect3& start,
-                        const VHACD::Vect3& to,
-                        double& outT,
-                        double& faceSign,
-                        VHACD::Vect3& hitLocation) const
-{
-    VHACD::Vect3 dir = to - start;
-    double distance = dir.Normalize();
-    double u, v, w;
-    uint32_t faceIndex;
-    bool hit = TraceRay(start,
-                        dir,
-                        outT,
-                        u,
-                        v,
-                        w,
-                        faceSign,
-                        faceIndex);
-    if (hit)
-    {
-        hitLocation = start + dir * outT;
-    }
-
-    if (hit && outT > distance)
-    {
-        hit = false;
-    }
-    return hit;
 }
 
 bool AABBTree::TraceRay(const VHACD::Vect3& start,
@@ -4413,21 +3633,6 @@ bool AABBTree::TraceRay(const VHACD::Vect3& start,
     return (outT != FLT_MAX);
 }
 
-VHACD::Vect3 AABBTree::GetCenter() const
-{
-    return m_nodes[0].m_extents.GetCenter();
-}
-
-VHACD::Vect3 AABBTree::GetMinExtents() const
-{
-    return m_nodes[0].m_extents.GetMin();
-}
-
-VHACD::Vect3 AABBTree::GetMaxExtents() const
-{
-    return m_nodes[0].m_extents.GetMax();
-}
-
 bool AABBTree::GetClosestPointWithinDistance(const VHACD::Vect3& point,
                                              double maxDistance,
                                              VHACD::Vect3& closestPoint) const
@@ -4461,69 +3666,6 @@ uint32_t AABBTree::PartitionMedian(Node& n,
 }
 
 // partition faces based on the surface area heuristic
-uint32_t AABBTree::PartitionSAH(Node&,
-                                uint32_t* faces,
-                                uint32_t numFaces)
-{
-    uint32_t bestAxis = 0;
-    uint32_t bestIndex = 0;
-    double bestCost = FLT_MAX;
-
-    for (uint32_t a = 0; a < 3; ++a)
-    {
-        // sort faces by centroids
-        FaceSorter predicate(*m_vertices,
-                             *m_indices,
-                             a);
-        std::sort(faces,
-                  faces + numFaces,
-                  predicate);
-
-        // two passes over data to calculate upper and lower bounds
-        std::vector<double> cumulativeLower(numFaces);
-        std::vector<double> cumulativeUpper(numFaces);
-
-        VHACD::BoundsAABB lower;
-        VHACD::BoundsAABB upper;
-
-        for (uint32_t i = 0; i < numFaces; ++i)
-        {
-            lower.Union(m_faceBounds[faces[i]]);
-            upper.Union(m_faceBounds[faces[numFaces - i - 1]]);
-
-            cumulativeLower[i] = lower.SurfaceArea();
-            cumulativeUpper[numFaces - i - 1] = upper.SurfaceArea();
-        }
-
-        double invTotalSA = double(1.0) / cumulativeUpper[0];
-
-        // test all split positions
-        for (uint32_t i = 0; i < numFaces - 1; ++i)
-        {
-            double pBelow = cumulativeLower[i] * invTotalSA;
-            double pAbove = cumulativeUpper[i] * invTotalSA;
-
-            double cost = double(0.125) + (pBelow * i + pAbove * (numFaces - i));
-            if (cost <= bestCost)
-            {
-                bestCost = cost;
-                bestIndex = i;
-                bestAxis = a;
-            }
-        }
-    }
-
-    // re-sort by best axis
-    FaceSorter predicate(*m_vertices,
-                         *m_indices,
-                         bestAxis);
-    std::sort(faces,
-              faces + numFaces,
-              predicate);
-
-    return bestIndex + 1;
-}
-
 void AABBTree::Build()
 {
     const uint32_t numFaces = uint32_t(m_indices->size());
@@ -4531,17 +3673,9 @@ void AABBTree::Build()
     // build initial list of faces
     m_faces.reserve(numFaces);
 
-    // calculate bounds of each face and store
-    m_faceBounds.reserve(numFaces);
-
-    std::vector<VHACD::BoundsAABB> stack;
     for (uint32_t i = 0; i < numFaces; ++i)
     {
-        VHACD::BoundsAABB top = CalculateFaceBounds(&i,
-                                                    1);
-
         m_faces.push_back(i);
-        m_faceBounds.push_back(top);
     }
 
     m_nodes.reserve(uint32_t(numFaces * double(1.5)));
@@ -4554,7 +3688,6 @@ void AABBTree::Build()
                    m_faces.data(),
                    numFaces);
 
-    assert(s_depth == 0);
 }
 
 void AABBTree::BuildRecursive(uint32_t nodeIndex,
@@ -4574,8 +3707,6 @@ void AABBTree::BuildRecursive(uint32_t nodeIndex,
     Node& n = m_nodes[nodeIndex];
 
     // track max tree depth
-    ++s_depth;
-    m_treeDepth = std::max(m_treeDepth, s_depth);
 
     n.m_extents = CalculateFaceBounds(faces,
                                       numFaces);
@@ -4586,11 +3717,9 @@ void AABBTree::BuildRecursive(uint32_t nodeIndex,
         n.m_faces = faces;
         n.m_numFaces = numFaces;
 
-        ++m_leafNodes;
     }
     else
     {
-        ++m_innerNodes;
 
         // face counts for each branch
         const uint32_t leftCount = PartitionMedian(n, faces, numFaces);
@@ -4608,7 +3737,6 @@ void AABBTree::BuildRecursive(uint32_t nodeIndex,
         BuildRecursive(m_nodes[nodeIndex].m_children + 1, faces + leftCount, rightCount);
     }
 
-    --s_depth;
 }
 
 void AABBTree::TraceRecursive(uint32_t nodeIndex,
@@ -4863,9 +3991,6 @@ public:
                          const size_t j,
                          const size_t k);
 
-    const VoxelValue& GetVoxel(const size_t i,
-                               const size_t j,
-                               const size_t k) const;
 
     const std::vector<Voxel>& GetSurfaceVoxels() const;
     const std::vector<Voxel>& GetInteriorVoxels() const;
@@ -4877,9 +4002,6 @@ public:
     VHACD::BoundsAABB m_bounds;
     double m_scale{ 1.0 };
     VHACD::Vector3<uint32_t> m_dim{ 0 };
-    size_t m_numVoxelsOnSurface{ 0 };
-    size_t m_numVoxelsInsideSurface{ 0 };
-    size_t m_numVoxelsOutsideSurface{ 0 };
     std::vector<VoxelValue> m_data;
 private:
 
@@ -5081,9 +4203,6 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
 
     m_data = std::vector<VoxelValue>(m_dim[0] * m_dim[1] * m_dim[2],
                                      VoxelValue::PRIMITIVE_UNDEFINED);
-    m_numVoxelsOnSurface = 0;
-    m_numVoxelsInsideSurface = 0;
-    m_numVoxelsOutsideSurface = 0;
 
     VHACD::Vect3 p[3];
     VHACD::Vect3 boxcenter;
@@ -5156,7 +4275,6 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                         && value == VoxelValue::PRIMITIVE_UNDEFINED)
                     {
                         value = VoxelValue::PRIMITIVE_ON_SURFACE;
-                        ++m_numVoxelsOnSurface;
                         m_surfaceVoxels.emplace_back(uint32_t(i_id),
                                                      uint32_t(j_id),
                                                      uint32_t(k_id));
@@ -5222,7 +4340,6 @@ void Volume::RaycastFill(const AABBTree& aabbTree)
     std::vector<Voxel> temp;
     temp.reserve(maxSize);
     uint32_t count{ 0 };
-    m_numVoxelsInsideSurface = 0;
     for (uint32_t i = 0; i < i0; ++i)
     {
         for (uint32_t j = 0; j < j0; ++j)
@@ -5269,7 +4386,6 @@ void Volume::RaycastFill(const AABBTree& aabbTree)
                         voxel = VoxelValue::PRIMITIVE_INSIDE_SURFACE;
                         temp.emplace_back(i, j, k);
                         count++;
-                        m_numVoxelsInsideSurface++;
                     }
                     else
                     {
@@ -5301,16 +4417,6 @@ void Volume::SetVoxel(const size_t i,
 VoxelValue& Volume::GetVoxel(const size_t i,
                              const size_t j,
                              const size_t k)
-{
-    assert(i < m_dim[0]);
-    assert(j < m_dim[1]);
-    assert(k < m_dim[2]);
-    return m_data[k + j * m_dim[2] + i * m_dim[1] * m_dim[2]];
-}
-
-const VoxelValue& Volume::GetVoxel(const size_t i,
-                                   const size_t j,
-                                   const size_t k) const
 {
     assert(i < m_dim[0]);
     assert(j < m_dim[1]);
@@ -5450,7 +4556,6 @@ void Volume::FillOutsideSurface()
             }
         }
 
-        m_numVoxelsOutsideSurface += voxelsWalked;
     } while (voxelsWalked != 0);
 }
 
@@ -5478,7 +4583,6 @@ void Volume::FillInsideSurface()
                     v = VoxelValue::PRIMITIVE_INSIDE_SURFACE;
                     temp.emplace_back(i, j, k);
                     count++;
-                    ++m_numVoxelsInsideSurface;
                 }
             }
         }
@@ -5613,7 +4717,6 @@ void ShrinkWrap(SimpleMesh& sourceConvexHull,
 enum class Stages
 {
     COMPUTE_BOUNDS_OF_INPUT_MESH,
-    REINDEXING_INPUT_MESH,
     CREATE_RAYCAST_MESH,
     VOXELIZING_INPUT_MESH,
     BUILD_INITIAL_CONVEX_HULL,
@@ -6083,7 +5186,6 @@ public:
 class HullPair
 {
 public:
-    HullPair() = default;
     HullPair(uint32_t hullA,
              uint32_t hullB,
              double concavity);
@@ -6230,22 +5332,15 @@ public:
     VHACD::Vect3                                        m_center;
     double                                              m_scale{ double(1.0) };
     double                                              m_recipScale{ double(1.0) };
-    SimpleMesh                                          m_inputMesh; // re-indexed and normalized input mesh
     std::vector<VHACD::Vertex>                          m_vertices;
     std::vector<VHACD::Triangle>                        m_indices;
 
     double                                              m_overallHullVolume{ double(0.0) };
     double                                              m_voxelScale{ double(0.0) };
-    double                                              m_voxelHalfScale{ double(0.0) };
-    VHACD::Vect3                                        m_voxelBmin;
-    VHACD::Vect3                                        m_voxelBmax;
     uint32_t                                            m_meshId{ 0 };
     std::priority_queue<HullPair>                       m_hullPairQueue;
     std::unordered_map<uint32_t, IVHACD::ConvexHull*>   m_hulls;
 
-    double                                              m_overallProgress{ double(0.0) };
-    double                                              m_stageProgress{ double(0.0) };
-    double                                              m_operationProgress{ double(0.0) };
 };
 
 void VHACDImpl::Cancel()
@@ -6493,16 +5588,11 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                             m_params.m_fillMode,
                             m_AABBTree);
         m_voxelScale = m_voxelize.GetScale();
-        m_voxelHalfScale = m_voxelScale * double(0.5);
-        m_voxelBmin = m_voxelize.GetBounds().GetMin();
-        m_voxelBmax = m_voxelize.GetBounds().GetMax();
         ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
                        100,
                        "Voxelization complete");
     }
 
-    m_inputMesh.m_vertices = m_vertices;
-    m_inputMesh.m_indices = m_indices;
     if ( !m_canceled )
     {
         ProgressUpdate(Stages::BUILD_INITIAL_CONVEX_HULL,
@@ -6792,7 +5882,6 @@ void VHACDImpl::PerformConvexDecomposition()
                     }
                 }
                 // Ok...once we are done, we copy the results!
-                m_meshId -= 0;
                 ProgressUpdate(Stages::FINALIZING_RESULTS,
                                0,
                                "Finalizing results");
@@ -7056,9 +6145,6 @@ const char* VHACDImpl::GetStageName(Stages stage) const
     {
         case Stages::COMPUTE_BOUNDS_OF_INPUT_MESH:
             ret = "COMPUTE_BOUNDS_OF_INPUT_MESH";
-            break;
-        case Stages::REINDEXING_INPUT_MESH:
-            ret = "REINDEXING_INPUT_MESH";
             break;
         case Stages::CREATE_RAYCAST_MESH:
             ret = "CREATE_RAYCAST_MESH";
