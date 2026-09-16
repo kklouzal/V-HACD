@@ -392,7 +392,6 @@ public:
         uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull
         bool                m_asyncACD{ true };             // Whether or not to run asynchronously, taking advantage of additional cores
         uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
-        bool                m_findBestPlane{ false };       // Whether or not to attempt to split planes along the best location. Experimental feature. False by default.
     };
 
     /**
@@ -5838,10 +5837,7 @@ public:
     // Helper method to refresh the min/max voxel bounding region
     void MinMaxVoxelRegion(const Voxel &v);
 
-    void BuildRaycastMesh();
-
-    // We now compute the convex hull relative to a triangle mesh generated
-    // from the voxels
+    // Computes the convex hull of the corner points gathered by CollectHullPoints
     void ComputeConvexHull();
 
     // Returns true if this convex hull should be considered done
@@ -5862,80 +5858,20 @@ public:
     // add it to the index map
     uint32_t GetVertexIndex(const VHACD::Vector3<uint32_t>& p);
 
-    // This method will convert the voxels into an actual indexed triangle mesh of boxes
-    // This serves two purposes.
-    // The primary purpose is so that when we compute a convex hull it considered all of the points
-    // for each voxel, not just the center point. If you don't do this, then the hulls don't fit the
-    // mesh accurately enough.
-    // The second reason we convert it into a triangle mesh is so that we can do raycasting against it
-    // to search for the best splitting plane fairly quickly. That algorithm will be discussed in the
-    // method which computes the best splitting plane.
-    void BuildVoxelMesh();
+    // Gathers the corners of every surface voxel (original and split-plane) as hull input points.
+    // Corners, not voxel centers, are required: a hull of the centers would not enclose the voxels.
+    // Interior voxels cannot contribute hull vertices and are skipped.
+    void CollectHullPoints();
 
-    // Convert a single voxel position into an actual 3d box mesh comprised
-    // of 12 triangles
-    void AddVoxelBox(const Voxel &v);
+    // Indexes the 8 corners of a single voxel
+    void AddVoxelCorners(const Voxel &v);
 
-    // Add the triangle represented by these 3 indices into the 'box' set of vertices
-    // to the output mesh
-    void AddTri(const std::array<VHACD::Vector3<uint32_t>, 8>& box,
-                uint32_t i1,
-                uint32_t i2,
-                uint32_t i3);
-
-    // Here we convert from voxel space to a 3d position, index it, and add
-    // the triangle positions and indices for the output mesh
-    void AddTriangle(const VHACD::Vector3<uint32_t>& p1,
-                     const VHACD::Vector3<uint32_t>& p2,
-                     const VHACD::Vector3<uint32_t>& p3);
-
-    // When computing the split plane, we start by simply
-    // taking the midpoint of the longest side. However,
-    // we can also search the surface and look for the greatest
-    // spot of concavity and use that as the split location.
-    // This will make the convex decomposition more efficient
-    // as it will tend to cut across the greatest point of
-    // concavity on the surface.
+    // Splits at the midpoint of the longest side of the voxel region
     SplitAxis ComputeSplitPlane(uint32_t& location);
-
-    VHACD::Vect3 GetPosition(const VHACD::Vector3<int32_t>& ip) const;
-
-    double Raycast(const VHACD::Vector3<int32_t>& p1,
-                   const VHACD::Vector3<int32_t>& p2) const;
-
-    bool FindConcavity(uint32_t idx,
-                       uint32_t& splitLoc);
-
-    // Finding the greatest area of concavity..
-    bool FindConcavityX(uint32_t& splitLoc);
-
-    // Finding the greatest area of concavity..
-    bool FindConcavityY(uint32_t& splitLoc);
-
-    // Finding the greatest area of concavity..
-    bool FindConcavityZ(uint32_t& splitLoc);
 
     // This operation is performed in a background thread.
     // It splits the voxels by a plane
     void PerformPlaneSplit();
-
-    // Used only for debugging. Saves the voxelized mesh to disk
-    // Optionally saves the original source mesh as well for comparison
-    void SaveVoxelMesh(const SimpleMesh& inputMesh,
-                       bool saveVoxelMesh,
-                       bool saveSourceMesh);
-
-    void SaveOBJ(const char* fname,
-                 const VoxelHull* h);
-
-    void SaveOBJ(const char* fname);
-
-private:
-    void WriteOBJ(FILE* fph,
-                  const std::vector<VHACD::Vertex>& vertices,
-                  const std::vector<VHACD::Triangle>& indices,
-                  uint32_t baseIndex);
-public:
 
     SplitAxis               m_axis{ SplitAxis::X_AXIS_NEGATIVE };
     Volume*                 m_voxels{ nullptr }; // The voxelized data set
@@ -5961,10 +5897,8 @@ public:
     // of the entire source
     VHACD::Vector3<uint32_t>                    m_1{ 0 };
     VHACD::Vector3<uint32_t>                    m_2{ 0 };
-    AABBTree                                    m_AABBTree;
     std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
     std::vector<VHACD::Vertex>                  m_vertices;
-    std::vector<VHACD::Triangle>                m_indices;
     static uint32_t                             m_voxelHullCount;
     IVHACD::Parameters                          m_params;
     VHACDCallbacks*                             m_callbacks{ nullptr };
@@ -6105,8 +6039,7 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
         MinMaxVoxelRegion(i);
     }
 
-    BuildVoxelMesh();
-    BuildRaycastMesh(); // build a raycast mesh of the voxel mesh
+    CollectHullPoints();
     ComputeConvexHull();
 }
 
@@ -6127,8 +6060,7 @@ VoxelHull::VoxelHull(Volume& voxels,
     , m_params(params)
     , m_callbacks(callbacks)
 {
-    BuildVoxelMesh();
-    BuildRaycastMesh(); // build a raycast mesh of the voxel mesh
+    CollectHullPoints();
     ComputeConvexHull();
 }
 
@@ -6137,16 +6069,6 @@ void VoxelHull::MinMaxVoxelRegion(const Voxel& v)
     VHACD::Vector3<uint32_t> x = v.GetVoxel();
     m_1 = m_1.CWiseMin(x);
     m_2 = m_2.CWiseMax(x);
-}
-
-void VoxelHull::BuildRaycastMesh()
-{
-    // Create a raycast mesh representation of the voxelized surface mesh
-    if ( !m_indices.empty() )
-    {
-        m_AABBTree = AABBTree(m_vertices,
-                              m_indices);
-    }
 }
 
 void VoxelHull::ComputeConvexHull()
@@ -6246,347 +6168,51 @@ uint32_t VoxelHull::GetVertexIndex(const VHACD::Vector3<uint32_t>& p)
     return ret;
 }
 
-void VoxelHull::BuildVoxelMesh()
+void VoxelHull::CollectHullPoints()
 {
-    // When we build the triangle mesh we do *not* need the interior voxels, only the ones
-    // which lie upon the logical surface of the mesh.
-    // Each time we perform a plane split, voxels which are along the splitting plane become
-    // 'new surface voxels'.
-
-    for (auto& i : m_surfaceVoxels)
+    for (const Voxel& v : m_surfaceVoxels)
     {
-        AddVoxelBox(i);
+        AddVoxelCorners(v);
     }
-    for (auto& i : m_newSurfaceVoxels)
+    for (const Voxel& v : m_newSurfaceVoxels)
     {
-        AddVoxelBox(i);
+        AddVoxelCorners(v);
     }
 }
 
-void VoxelHull::AddVoxelBox(const Voxel &v)
+void VoxelHull::AddVoxelCorners(const Voxel &v)
 {
-    // The voxel position of the upper left corner of the box
-    VHACD::Vector3<uint32_t> bmin(v.GetX(),
-                                  v.GetY(),
-                                  v.GetZ());
-    // The voxel position of the lower right corner of the box
-    VHACD::Vector3<uint32_t> bmax(bmin.GetX() + 1,
-                                  bmin.GetY() + 1,
-                                  bmin.GetZ() + 1);
-
-    // Build the set of 8 voxel positions representing
-    // the coordinates of the box
-    std::array<VHACD::Vector3<uint32_t>, 8> box{{
-        { bmin.GetX(), bmin.GetY(), bmin.GetZ() },
-        { bmax.GetX(), bmin.GetY(), bmin.GetZ() },
-        { bmax.GetX(), bmax.GetY(), bmin.GetZ() },
-        { bmin.GetX(), bmax.GetY(), bmin.GetZ() },
-        { bmin.GetX(), bmin.GetY(), bmax.GetZ() },
-        { bmax.GetX(), bmin.GetY(), bmax.GetZ() },
-        { bmax.GetX(), bmax.GetY(), bmax.GetZ() },
-        { bmin.GetX(), bmax.GetY(), bmax.GetZ() }
-    }};
-
-    // Now add the 12 triangles comprising the 3d box
-    AddTri(box, 2, 1, 0);
-    AddTri(box, 3, 2, 0);
-
-    AddTri(box, 7, 2, 3);
-    AddTri(box, 7, 6, 2);
-
-    AddTri(box, 5, 1, 2);
-    AddTri(box, 5, 2, 6);
-
-    AddTri(box, 5, 4, 1);
-    AddTri(box, 4, 0, 1);
-
-    AddTri(box, 4, 6, 7);
-    AddTri(box, 4, 5, 6);
-
-    AddTri(box, 4, 7, 0);
-    AddTri(box, 7, 3, 0);
-}
-
-void VoxelHull::AddTri(const std::array<VHACD::Vector3<uint32_t>, 8>& box,
-                       uint32_t i1,
-                       uint32_t i2,
-                       uint32_t i3)
-{
-    AddTriangle(box[i1], box[i2], box[i3]);
-}
-
-void VoxelHull::AddTriangle(const VHACD::Vector3<uint32_t>& p1,
-                            const VHACD::Vector3<uint32_t>& p2,
-                            const VHACD::Vector3<uint32_t>& p3)
-{
-    uint32_t i1 = GetVertexIndex(p1);
-    uint32_t i2 = GetVertexIndex(p2);
-    uint32_t i3 = GetVertexIndex(p3);
-
-    m_indices.emplace_back(i1, i2, i3);
+    const uint32_t x = v.GetX();
+    const uint32_t y = v.GetY();
+    const uint32_t z = v.GetZ();
+    for (uint32_t dz = 0; dz < 2; ++dz)
+    {
+        for (uint32_t dy = 0; dy < 2; ++dy)
+        {
+            for (uint32_t dx = 0; dx < 2; ++dx)
+            {
+                GetVertexIndex(VHACD::Vector3<uint32_t>(x + dx, y + dy, z + dz));
+            }
+        }
+    }
 }
 
 SplitAxis VoxelHull::ComputeSplitPlane(uint32_t& location)
 {
-    SplitAxis ret = SplitAxis::X_AXIS_NEGATIVE;
-
-    VHACD::Vector3<uint32_t> d = m_2 - m_1;
+    const VHACD::Vector3<uint32_t> d = m_2 - m_1;
 
     if ( d.GetX() >= d.GetY() && d.GetX() >= d.GetZ() )
     {
-        ret = SplitAxis::X_AXIS_NEGATIVE;
         location = (m_2.GetX() + 1 + m_1.GetX()) / 2;
-        uint32_t edgeLoc;
-        if ( m_params.m_findBestPlane && FindConcavityX(edgeLoc) )
-        {
-            location = edgeLoc;
-        }
+        return SplitAxis::X_AXIS_NEGATIVE;
     }
-    else if ( d.GetY() >= d.GetX() && d.GetY() >= d.GetZ() )
+    if ( d.GetY() >= d.GetX() && d.GetY() >= d.GetZ() )
     {
-        ret = SplitAxis::Y_AXIS_NEGATIVE;
         location = (m_2.GetY() + 1 + m_1.GetY()) / 2;
-        uint32_t edgeLoc;
-        if ( m_params.m_findBestPlane && FindConcavityY(edgeLoc) )
-        {
-            location = edgeLoc;
-        }
+        return SplitAxis::Y_AXIS_NEGATIVE;
     }
-    else
-    {
-        ret = SplitAxis::Z_AXIS_NEGATIVE;
-        location = (m_2.GetZ() + 1 + m_1.GetZ()) / 2;
-        uint32_t edgeLoc;
-        if ( m_params.m_findBestPlane && FindConcavityZ(edgeLoc) )
-        {
-            location = edgeLoc;
-        }
-    }
-
-    return ret;
-}
-
-VHACD::Vect3 VoxelHull::GetPosition(const VHACD::Vector3<int32_t>& ip) const
-{
-    return GetPoint(ip.GetX(),
-                    ip.GetY(),
-                    ip.GetZ(),
-                    m_voxelScale,
-                    m_voxelAdjust);
-}
-
-double VoxelHull::Raycast(const VHACD::Vector3<int32_t>& p1,
-                          const VHACD::Vector3<int32_t>& p2) const
-{
-    double ret;
-    VHACD::Vect3 from = GetPosition(p1);
-    VHACD::Vect3 to = GetPosition(p2);
-
-    double outT;
-    double faceSign;
-    VHACD::Vect3 hitLocation;
-    if (m_AABBTree.TraceRay(from, to, outT, faceSign, hitLocation))
-    {
-        ret = (from - hitLocation).GetNorm();
-    }
-    else
-    {
-        ret = 0; // if it doesn't hit anything, just assign it to zero.
-    }
-
-    return ret;
-}
-
-bool VoxelHull::FindConcavity(uint32_t idx,
-                              uint32_t& splitLoc)
-{
-    bool ret = false;
-
-    int32_t d = (m_2[idx] - m_1[idx]) + 1; // The length of the getX axis in voxel space
-
-    uint32_t idx1;
-    uint32_t idx2;
-    uint32_t idx3;
-    switch (idx)
-    {
-        case 0: // X
-            idx1 = 0;
-            idx2 = 1;
-            idx3 = 2;
-            break;
-        case 1: // Y
-            idx1 = 1;
-            idx2 = 0;
-            idx3 = 2;
-            break;
-        case 2:
-            idx1 = 2;
-            idx2 = 1;
-            idx3 = 0;
-            break;
-        default:
-            /*
-                * To silence uninitialized variable warnings
-                */
-            idx1 = 0;
-            idx2 = 0;
-            idx3 = 0;
-            assert(0 && "findConcavity::idx must be 0, 1, or 2");
-            break;
-    }
-
-    // We will compute the edge error on the XY plane and the XZ plane
-    // searching for the greatest location of concavity
-    std::vector<double> edgeError1 = std::vector<double>(d);
-    std::vector<double> edgeError2 = std::vector<double>(d);
-
-    // Counter of number of voxel samples on the XY plane we have accumulated
-    uint32_t index1 = 0;
-
-    // Compute Edge Error on the XY plane
-    for (uint32_t i0 = m_1[idx1]; i0 <= m_2[idx1]; i0++)
-    {
-        double errorTotal = 0;
-        // We now perform a raycast from the sides inward on the XY plane to
-        // determine the total error (distance of the surface from the sides)
-        // along this getX position.
-        for (uint32_t i1 = m_1[idx2]; i1 <= m_2[idx2]; i1++)
-        {
-            VHACD::Vector3<int32_t> p1;
-            VHACD::Vector3<int32_t> p2;
-            switch (idx)
-            {
-                case 0:
-                {
-                    p1 = VHACD::Vector3<int32_t>(i0, i1, m_1.GetZ() - 2);
-                    p2 = VHACD::Vector3<int32_t>(i0, i1, m_2.GetZ() + 2);
-                    break;
-                }
-                case 1:
-                {
-                    p1 = VHACD::Vector3<int32_t>(i1, i0, m_1.GetZ() - 2);
-                    p2 = VHACD::Vector3<int32_t>(i1, i0, m_2.GetZ() + 2);
-                    break;
-                }
-                case 2:
-                {
-                    p1 = VHACD::Vector3<int32_t>(m_1.GetX() - 2, i1, i0);
-                    p2 = VHACD::Vector3<int32_t>(m_2.GetX() + 2, i1, i0);
-                    break;
-                }
-            }
-
-            double e1 = Raycast(p1, p2);
-            double e2 = Raycast(p2, p1);
-
-            errorTotal = errorTotal + e1 + e2;
-        }
-        // The total amount of edge error along this voxel location
-        edgeError1[index1] = errorTotal;
-        index1++;
-    }
-
-    // Compute edge error along the XZ plane
-    uint32_t index2 = 0;
-
-    for (uint32_t i0 = m_1[idx1]; i0 <= m_2[idx1]; i0++)
-    {
-        double errorTotal = 0;
-
-        for (uint32_t i1 = m_1[idx3]; i1 <= m_2[idx3]; i1++)
-        {
-            VHACD::Vector3<int32_t> p1;
-            VHACD::Vector3<int32_t> p2;
-            switch (idx)
-            {
-                case 0:
-                {
-                    p1 = VHACD::Vector3<int32_t>(i0, m_1.GetY() - 2, i1);
-                    p2 = VHACD::Vector3<int32_t>(i0, m_2.GetY() + 2, i1);
-                    break;
-                }
-                case 1:
-                {
-                    p1 = VHACD::Vector3<int32_t>(m_1.GetX() - 2, i0, i1);
-                    p2 = VHACD::Vector3<int32_t>(m_2.GetX() + 2, i0, i1);
-                    break;
-                }
-                case 2:
-                {
-                    p1 = VHACD::Vector3<int32_t>(i1, m_1.GetY() - 2, i0);
-                    p2 = VHACD::Vector3<int32_t>(i1, m_2.GetY() + 2, i0);
-                    break;
-                }
-            }
-
-            double e1 = Raycast(p1, p2); // raycast from one side to the interior
-            double e2 = Raycast(p2, p1); // raycast from the other side to the interior
-
-            errorTotal = errorTotal + e1 + e2;
-        }
-        edgeError2[index2] = errorTotal;
-        index2++;
-    }
-
-
-    // we now compute the first derivative to find the greatest spot of concavity on the XY plane
-    double maxDiff = 0;
-    uint32_t maxC = 0;
-    for (uint32_t x = 1; x < index1; x++)
-    {
-        if ( edgeError1[x] > 0 &&  edgeError1[x - 1] > 0 )
-        {
-            double diff = abs(edgeError1[x] - edgeError1[x - 1]);
-            if ( diff > maxDiff )
-            {
-                maxDiff = diff;
-                maxC = x-1;
-            }
-        }
-    }
-
-    // Now see if there is a greater concavity on the XZ plane
-    for (uint32_t x = 1; x < index2; x++)
-    {
-        if ( edgeError2[x] > 0 && edgeError2[x - 1] > 0 )
-        {
-            double diff = abs(edgeError2[x] - edgeError2[x - 1]);
-            if ( diff > maxDiff )
-            {
-                maxDiff = diff;
-                maxC = x - 1;
-            }
-        }
-    }
-
-    splitLoc = maxC + m_1[idx1];
-
-    // we do not allow an edge split if it is too close to the ends
-    if (    splitLoc > (m_1[idx1] + 4)
-         && splitLoc < (m_2[idx1] - 4) )
-    {
-        ret = true;
-    }
-
-    return ret;
-}
-
-// Finding the greatest area of concavity..
-bool VoxelHull::FindConcavityX(uint32_t& splitLoc)
-{
-    return FindConcavity(0, splitLoc);
-}
-
-// Finding the greatest area of concavity..
-bool VoxelHull::FindConcavityY(uint32_t& splitLoc)
-{
-    return FindConcavity(1, splitLoc);
-}
-
-// Finding the greatest area of concavity..
-bool VoxelHull::FindConcavityZ(uint32_t &splitLoc)
-{
-    return FindConcavity(2, splitLoc);
+    location = (m_2.GetZ() + 1 + m_1.GetZ()) / 2;
+    return SplitAxis::Z_AXIS_NEGATIVE;
 }
 
 void VoxelHull::PerformPlaneSplit()
@@ -6619,107 +6245,6 @@ void VoxelHull::PerformPlaneSplit()
                 m_hullB = std::unique_ptr<VoxelHull>(new VoxelHull(*this, SplitAxis::Z_AXIS_POSITIVE, splitLoc));
                 break;
         }
-    }
-}
-
-void VoxelHull::SaveVoxelMesh(const SimpleMesh &inputMesh,
-                              bool saveVoxelMesh,
-                              bool saveSourceMesh)
-{
-    char scratch[512];
-    snprintf(scratch,
-             sizeof(scratch),
-             "voxel-mesh-%03d.obj",
-             m_index);
-    FILE *fph = fopen(scratch,
-                      "wb");
-    if ( fph )
-    {
-        uint32_t baseIndex = 1;
-        if ( saveVoxelMesh )
-        {
-            WriteOBJ(fph,
-                     m_vertices,
-                     m_indices,
-                     baseIndex);
-            baseIndex += uint32_t(m_vertices.size());
-        }
-        if ( saveSourceMesh )
-        {
-            WriteOBJ(fph,
-                     inputMesh.m_vertices,
-                     inputMesh.m_indices,
-                     baseIndex);
-        }
-        fclose(fph);
-    }
-}
-
-void VoxelHull::SaveOBJ(const char* fname,
-                        const VoxelHull* h)
-{
-    FILE *fph = fopen(fname,"wb");
-    if ( fph )
-    {
-        uint32_t baseIndex = 1;
-        WriteOBJ(fph,
-                 m_vertices,
-                 m_indices,
-                 baseIndex);
-
-        baseIndex += uint32_t(m_vertices.size());
-
-        WriteOBJ(fph,
-                 h->m_vertices,
-                 h->m_indices,
-                 baseIndex);
-        fclose(fph);
-    }
-}
-
-void VoxelHull::SaveOBJ(const char *fname)
-{
-    FILE *fph = fopen(fname, "wb");
-    if ( fph )
-    {
-        printf("Saving '%s' with %d vertices and %d triangles\n",
-                fname,
-                uint32_t(m_vertices.size()),
-                uint32_t(m_indices.size()));
-        WriteOBJ(fph,
-                 m_vertices,
-                 m_indices,
-                 1);
-        fclose(fph);
-    }
-}
-
-void VoxelHull::WriteOBJ(FILE* fph,
-                         const std::vector<VHACD::Vertex>& vertices,
-                         const std::vector<VHACD::Triangle>& indices,
-                         uint32_t baseIndex)
-{
-    if (!fph)
-    {
-        return;
-    }
-
-    for (size_t i = 0; i < vertices.size(); ++i)
-    {
-        const VHACD::Vertex& v = vertices[i];
-        fprintf(fph, "v %0.9f %0.9f %0.9f\n",
-                v.mX,
-                v.mY,
-                v.mZ);
-    }
-
-    for (size_t i = 0; i < indices.size(); ++i)
-    {
-        const VHACD::Triangle& t = indices[i];
-        fprintf(fph, "f %d %d %d\n",
-                t.mI0 + baseIndex,
-                t.mI1 + baseIndex,
-                t.mI2 + baseIndex);
     }
 }
 

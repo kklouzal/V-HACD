@@ -171,7 +171,6 @@ int main(int argc,const char **argv)
 		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 64\n");
 		printf("-a <true/false>         : Whether or not to run asynchronously. Default is 'true'\n");
 		printf("-l <minEdgeLength>      : Minimum size of a voxel edge. Default value is 2 voxels.\n");
-		printf("-p <true/false>         : If false, splits hulls in the middle. If true, tries to find optimal split plane location. False by default.\n");
 		printf("-o <obj/stl/usda>       : Export the convex hulls as a series of wavefront OBJ files, STL files, or a single USDA.\n");
 		printf("-g <true/false>         : If set to false, no logging will be displayed.\n");
 	}
@@ -347,20 +346,6 @@ int main(int argc,const char **argv)
 						else
 						{
 							printf("Synchronous mode disabled\n");
-						}
-					}
-				}
-				else if ( strcmp(option,"-p") == 0 )
-				{
-					if ( getTrueFalse(value,p.m_findBestPlane) )
-					{
-						if ( p.m_findBestPlane)
-						{
-							printf("Find best split plane location enabled\n");
-						}
-						else
-						{
-							printf("Using binary plane split\n");
 						}
 					}
 				}
