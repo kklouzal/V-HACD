@@ -5190,6 +5190,9 @@ public:
              uint32_t hullB,
              double concavity);
 
+    // std::priority_queue pops its greatest element. The greatest pair has the lowest concavity, then
+    // the lowest hull ids, so the merge sequence does not depend on the queue's internal ordering.
+    // Concavity is finite, so this is a strict total order.
     bool operator<(const HullPair &h) const;
 
     uint32_t    m_hullA{ 0 };
@@ -5204,11 +5207,20 @@ HullPair::HullPair(uint32_t hullA,
     , m_hullB(hullB)
     , m_concavity(concavity)
 {
+    assert(std::isfinite(concavity));
 }
 
 bool HullPair::operator<(const HullPair &h) const
 {
-    return m_concavity > h.m_concavity ? true : false;
+    if ( m_concavity != h.m_concavity )
+    {
+        return m_concavity > h.m_concavity;
+    }
+    if ( m_hullA != h.m_hullA )
+    {
+        return m_hullA > h.m_hullA;
+    }
+    return m_hullB > h.m_hullB;
 }
 
 class VHACDImpl : public IVHACD, public VHACDCallbacks
@@ -5268,8 +5280,6 @@ public:
 
     void AddCostToPriorityQueue(CostTask& task);
 
-    void ReleaseConvexHull(ConvexHull* ch);
-
     void PerformConvexDecomposition();
 
     double ComputeConvexHullVolume(const ConvexHull& sm);
@@ -5291,23 +5301,24 @@ public:
 
     void PerformMergeCostTask(CostTask& mt);
 
-    ConvexHull* ComputeReducedConvexHull(const ConvexHull& ch,
-                                         uint32_t maxVerts,
-                                         bool projectHullVertices);
+    std::unique_ptr<ConvexHull> ComputeReducedConvexHull(const ConvexHull& ch,
+                                                         uint32_t maxVerts,
+                                                         bool projectHullVertices);
 
     // Take the points in convex hull A and the points in convex hull B and generate
     // a new convex hull on the combined set of points.
     // Once completed, we create a SimpleMesh instance to hold the triangle mesh
     // and we compute an inflated AABB for it.
-    ConvexHull* ComputeCombinedConvexHull(const ConvexHull& sm1,
-                                          const ConvexHull& sm2);
+    std::unique_ptr<ConvexHull> ComputeCombinedConvexHull(const ConvexHull& sm1,
+                                                          const ConvexHull& sm2);
 
+    // Returns the live hull with this id, or nullptr once it has been merged away
+    ConvexHull* GetHull(uint32_t id);
 
-    ConvexHull* GetHull(uint32_t index);
+    // Assigns the next id and takes ownership; returns the stored hull
+    ConvexHull* AddHull(std::unique_ptr<ConvexHull> hull);
 
-    bool RemoveHull(uint32_t index);
-
-    ConvexHull* CopyConvexHull(const ConvexHull& source);
+    void RemoveHull(uint32_t id);
 
     const char* GetStageName(Stages stage) const;
 
@@ -5323,7 +5334,7 @@ public:
     std::atomic<bool>                                   m_canceled{ false };
     Parameters                                          m_params; // Convex decomposition parameters
 
-    std::vector<IVHACD::ConvexHull*>                    m_convexHulls; // Finalized convex hulls
+    std::vector<std::unique_ptr<IVHACD::ConvexHull>>    m_convexHulls; // Finalized convex hulls
     std::vector<std::unique_ptr<VoxelHull>>             m_voxelHulls; // completed voxel hulls
     std::vector<std::unique_ptr<VoxelHull>>             m_pendingHulls;
 
@@ -5337,10 +5348,11 @@ public:
 
     double                                              m_overallHullVolume{ double(0.0) };
     double                                              m_voxelScale{ double(0.0) };
-    uint32_t                                            m_meshId{ 0 };
     std::priority_queue<HullPair>                       m_hullPairQueue;
-    std::unordered_map<uint32_t, IVHACD::ConvexHull*>   m_hulls;
-
+    // Hulls being merged, indexed by id. A merged-away hull leaves a null entry, so iterating the
+    // table visits live hulls in creation order.
+    std::vector<std::unique_ptr<IVHACD::ConvexHull>>    m_hulls;
+    size_t                                              m_liveHullCount{ 0 };
 };
 
 void VHACDImpl::Cancel()
@@ -5423,17 +5435,11 @@ bool VHACDImpl::GetConvexHull(const uint32_t index,
 
 void VHACDImpl::Clean()
 {
-    for (auto& ch : m_convexHulls)
-    {
-        ReleaseConvexHull(ch);
-    }
     m_convexHulls.clear();
-
-    for (auto& ch : m_hulls)
-    {
-        ReleaseConvexHull(ch.second);
-    }
     m_hulls.clear();
+    m_liveHullCount = 0;
+    // Pairs refer to hull ids, which a later Compute reuses.
+    m_hullPairQueue = std::priority_queue<HullPair>();
 
     m_voxelHulls.clear();
 
@@ -5636,14 +5642,6 @@ void VHACDImpl::AddCostToPriorityQueue(CostTask& task)
     m_hullPairQueue.push(hp);
 }
 
-void VHACDImpl::ReleaseConvexHull(ConvexHull* ch)
-{
-    if ( ch )
-    {
-        delete ch;
-    }
-}
-
 void VHACDImpl::PerformConvexDecomposition()
 {
     {
@@ -5705,12 +5703,8 @@ void VHACDImpl::PerformConvexDecomposition()
 
     if ( !m_canceled )
     {
-        // Give each convex hull a unique guid
-        m_meshId = 0;
         m_hulls.clear();
-
-        // Build the convex hull id map
-        std::vector<ConvexHull*> hulls;
+        m_liveHullCount = 0;
 
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
                        0,
@@ -5721,10 +5715,7 @@ void VHACDImpl::PerformConvexDecomposition()
             {
                 break;
             }
-            ConvexHull* ch = CopyConvexHull(*vh->m_convexHull);
-            m_meshId++;
-            ch->m_meshId = m_meshId;
-            m_hulls[m_meshId] = ch;
+            ConvexHull* ch = AddHull(std::unique_ptr<ConvexHull>(new ConvexHull(*vh->m_convexHull)));
             // Compute the volume of the convex hull
             ch->m_volume = ComputeConvexHullVolume(*ch);
             // Compute the AABB of the convex hull
@@ -5735,8 +5726,6 @@ void VHACDImpl::PerformConvexDecomposition()
             ComputeCentroid(ch->m_points,
                             ch->m_triangles,
                             ch->m_center);
-
-            hulls.push_back(ch);
         }
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
                         100,
@@ -5746,7 +5735,7 @@ void VHACDImpl::PerformConvexDecomposition()
 
         // here we merge convex hulls as needed until the match the
         // desired maximum hull count.
-        size_t hullCount = hulls.size();
+        size_t hullCount = m_hulls.size();
 
         if ( hullCount > m_params.m_maxConvexHulls && !m_canceled)
         {
@@ -5764,11 +5753,11 @@ void VHACDImpl::PerformConvexDecomposition()
                            "Computing Hull Merge Cost Matrix");
             for (size_t i = 1; i < hullCount && !m_canceled; i++)
             {
-                ConvexHull* chA = hulls[i];
+                ConvexHull* chA = m_hulls[i].get();
 
                 for (size_t j = 0; j < i && !m_canceled; j++)
                 {
-                    ConvexHull* chB = hulls[j];
+                    ConvexHull* chB = m_hulls[j].get();
 
                     CostTask ct;
                     ct.m_hullA = chA;
@@ -5801,11 +5790,11 @@ void VHACDImpl::PerformConvexDecomposition()
                 // Now that we know the cost to merge each hull, we can begin merging them.
                 bool cancel = false;
 
-                uint32_t maxMergeCount = uint32_t(m_hulls.size()) - m_params.m_maxConvexHulls;
-                uint32_t startCount = uint32_t(m_hulls.size());
+                uint32_t maxMergeCount = uint32_t(m_liveHullCount) - m_params.m_maxConvexHulls;
+                uint32_t startCount = uint32_t(m_liveHullCount);
 
                 while (    !cancel
-                        && m_hulls.size() > m_params.m_maxConvexHulls
+                        && m_liveHullCount > m_params.m_maxConvexHulls
                         && !m_hullPairQueue.empty()
                         && !m_canceled)
                 {
@@ -5813,7 +5802,7 @@ void VHACDImpl::PerformConvexDecomposition()
                     if ( e >= double(0.1) )
                     {
                         t.Reset();
-                        uint32_t hullsProcessed = startCount - uint32_t(m_hulls.size() );
+                        uint32_t hullsProcessed = startCount - uint32_t(m_liveHullCount);
                         double stageProgress = double(hullsProcessed * 100) / double(maxMergeCount);
                         ProgressUpdate(Stages::MERGING_CONVEX_HULLS,
                                        stageProgress,
@@ -5840,36 +5829,40 @@ void VHACDImpl::PerformConvexDecomposition()
                     {
                         // This is the convex hull which results from combining the
                         // vertices in the two source hulls
-                        ConvexHull* combinedHull = ComputeCombinedConvexHull(*ch1,
-                                                                                *ch2);
+                        std::unique_ptr<ConvexHull> combined = ComputeCombinedConvexHull(*ch1,
+                                                                                         *ch2);
                         // The two old convex hulls are going to get removed
                         RemoveHull(hp.m_hullA);
                         RemoveHull(hp.m_hullB);
+                        // Pairs pushed below carry the combined hull's id, which AddHull assigns as
+                        // the current table size.
+                        combined->m_meshId = uint32_t(m_hulls.size());
 
-                        m_meshId++;
-                        combinedHull->m_meshId = m_meshId;
                         tasks.clear();
-                        tasks.reserve(m_hulls.size());
+                        tasks.reserve(m_liveHullCount);
 
                         // Compute the cost between this new merged hull
                         // and all existing convex hulls and then
                         // add that to the priority queue
-                        for (auto& i : m_hulls)
+                        for (const std::unique_ptr<ConvexHull>& secondHull : m_hulls)
                         {
                             if ( m_canceled )
                             {
                                 break;
                             }
-                            ConvexHull* secondHull = i.second;
+                            if ( !secondHull )
+                            {
+                                continue;
+                            }
                             CostTask ct;
-                            ct.m_hullA = combinedHull;
-                            ct.m_hullB = secondHull;
+                            ct.m_hullA = combined.get();
+                            ct.m_hullB = secondHull.get();
                             if ( !DoFastCost(ct) )
                             {
                                 tasks.push_back(ct);
                             }
                         }
-                        m_hulls[combinedHull->m_meshId] = combinedHull;
+                        AddHull(std::move(combined));
                         for (CostTask& task : tasks)
                         {
                             PerformMergeCostTask(task);
@@ -5881,60 +5874,38 @@ void VHACDImpl::PerformConvexDecomposition()
                         }
                     }
                 }
-                // Ok...once we are done, we copy the results!
-                ProgressUpdate(Stages::FINALIZING_RESULTS,
-                               0,
-                               "Finalizing results");
-                for (auto& i : m_hulls)
-                {
-                    if ( m_canceled )
-                    {
-                        break;
-                    }
-                    ConvexHull* ch = i.second;
-                    // We now must reduce the convex hull
-                    if ( ch->m_points.size() > m_params.m_maxNumVerticesPerCH || m_params.m_shrinkWrap)
-                    {
-                        ConvexHull* reduce = ComputeReducedConvexHull(*ch,
-                                                                      m_params.m_maxNumVerticesPerCH,
-                                                                      m_params.m_shrinkWrap);
-                        ReleaseConvexHull(ch);
-                        ch = reduce;
-                    }
-                    ScaleOutputConvexHull(*ch);
-                    ch->m_meshId = m_meshId;
-                    m_meshId++;
-                    m_convexHulls.push_back(ch);
-                }
-                m_hulls.clear(); // since the hulls were moved into the output list, we don't need to delete them from this container
-                ProgressUpdate(Stages::FINALIZING_RESULTS,
-                               100,
-                               "Finalized results complete");
             }
         }
-        else
+
+        if ( !m_canceled )
         {
+            // Output hulls follow the hull table, so their order depends only on creation order.
             ProgressUpdate(Stages::FINALIZING_RESULTS,
                            0,
                            "Finalizing results");
-            m_meshId = 0;
-            for (auto& ch : hulls)
+            for (std::unique_ptr<ConvexHull>& hull : m_hulls)
             {
-                // We now must reduce the convex hull
-                if ( ch->m_points.size() > m_params.m_maxNumVerticesPerCH  || m_params.m_shrinkWrap )
+                if ( m_canceled )
                 {
-                    ConvexHull* reduce = ComputeReducedConvexHull(*ch,
-                                                                  m_params.m_maxNumVerticesPerCH,
-                                                                  m_params.m_shrinkWrap);
-                    ReleaseConvexHull(ch);
-                    ch = reduce;
+                    break;
                 }
-                ScaleOutputConvexHull(*ch);
-                ch->m_meshId = m_meshId;
-                m_meshId++;
-                m_convexHulls.push_back(ch);
+                if ( !hull )
+                {
+                    continue;
+                }
+                // We now must reduce the convex hull
+                if ( hull->m_points.size() > m_params.m_maxNumVerticesPerCH || m_params.m_shrinkWrap )
+                {
+                    hull = ComputeReducedConvexHull(*hull,
+                                                    m_params.m_maxNumVerticesPerCH,
+                                                    m_params.m_shrinkWrap);
+                }
+                ScaleOutputConvexHull(*hull);
+                hull->m_meshId = uint32_t(m_convexHulls.size());
+                m_convexHulls.push_back(std::move(hull));
             }
             m_hulls.clear();
+            m_liveHullCount = 0;
             ProgressUpdate(Stages::FINALIZING_RESULTS,
                            100,
                            "Finalized results");
@@ -6029,18 +6000,17 @@ void VHACDImpl::PerformMergeCostTask(CostTask& mt)
     double volume1 = ch1->m_volume;
     double volume2 = ch2->m_volume;
 
-    ConvexHull* combined = ComputeCombinedConvexHull(*ch1,
-                                                     *ch2); // Build the combined convex hull
+    const std::unique_ptr<ConvexHull> combined = ComputeCombinedConvexHull(*ch1,
+                                                                           *ch2); // Build the combined convex hull
     double combinedVolume = ComputeConvexHullVolume(*combined); // get the combined volume
     mt.m_concavity = ComputeConcavity(volume1 + volume2,
                                       combinedVolume,
                                       m_overallHullVolume);
-    ReleaseConvexHull(combined);
 }
 
-IVHACD::ConvexHull* VHACDImpl::ComputeReducedConvexHull(const ConvexHull& ch,
-                                                        uint32_t maxVerts,
-                                                        bool projectHullVertices)
+std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeReducedConvexHull(const ConvexHull& ch,
+                                                                        uint32_t maxVerts,
+                                                                        bool projectHullVertices)
 {
     SimpleMesh sourceConvexHull;
 
@@ -6053,7 +6023,7 @@ IVHACD::ConvexHull* VHACDImpl::ComputeReducedConvexHull(const ConvexHull& ch,
                m_voxelScale,
                projectHullVertices);
 
-    ConvexHull *ret = new ConvexHull;
+    std::unique_ptr<ConvexHull> ret(new ConvexHull);
 
     ret->m_points = sourceConvexHull.m_vertices;
     ret->m_triangles = sourceConvexHull.m_indices;
@@ -6071,8 +6041,8 @@ IVHACD::ConvexHull* VHACDImpl::ComputeReducedConvexHull(const ConvexHull& ch,
     return ret;
 }
 
-IVHACD::ConvexHull* VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
-                                                         const ConvexHull& sm2)
+std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
+                                                                         const ConvexHull& sm2)
 {
     uint32_t vcount = uint32_t(sm1.m_points.size() + sm2.m_points.size()); // Total vertices from both hulls
     std::vector<VHACD::Vertex> vertices(vcount);
@@ -6087,7 +6057,7 @@ IVHACD::ConvexHull* VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
     qh.ComputeConvexHull(vertices,
                          vcount);
 
-    ConvexHull* ret = new ConvexHull;
+    std::unique_ptr<ConvexHull> ret(new ConvexHull);
     ret->m_points = qh.GetVertices();
     ret->m_triangles = qh.GetIndices();
 
@@ -6104,38 +6074,24 @@ IVHACD::ConvexHull* VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
     return ret;
 }
 
-IVHACD::ConvexHull* VHACDImpl::GetHull(uint32_t index)
+IVHACD::ConvexHull* VHACDImpl::GetHull(uint32_t id)
 {
-    ConvexHull* ret = nullptr;
-
-    auto found = m_hulls.find(index);
-    if ( found != m_hulls.end() )
-    {
-        ret = found->second;
-    }
-
-    return ret;
+    return id < m_hulls.size() ? m_hulls[id].get() : nullptr;
 }
 
-bool VHACDImpl::RemoveHull(uint32_t index)
+IVHACD::ConvexHull* VHACDImpl::AddHull(std::unique_ptr<ConvexHull> hull)
 {
-    bool ret = false;
-    auto found = m_hulls.find(index);
-    if ( found != m_hulls.end() )
-    {
-        ret = true;
-        ReleaseConvexHull(found->second);
-        m_hulls.erase(found);
-    }
-    return ret;
+    hull->m_meshId = uint32_t(m_hulls.size());
+    m_hulls.push_back(std::move(hull));
+    ++m_liveHullCount;
+    return m_hulls.back().get();
 }
 
-IVHACD::ConvexHull* VHACDImpl::CopyConvexHull(const ConvexHull& source)
+void VHACDImpl::RemoveHull(uint32_t id)
 {
-    ConvexHull *ch = new ConvexHull;
-    *ch = source;
-
-    return ch;
+    assert(id < m_hulls.size() && m_hulls[id]);
+    m_hulls[id].reset();
+    --m_liveHullCount;
 }
 
 const char* VHACDImpl::GetStageName(Stages stage) const
