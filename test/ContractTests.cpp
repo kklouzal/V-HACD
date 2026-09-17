@@ -284,6 +284,61 @@ void ProbeRadiusFillsNarrowGaps(IVHACD& v)
     CHECK(v.GetNConvexHulls() > 1);
 }
 
+// Hulls may overlap, which is what lets a plus sign be two crossing bars: a decomposition that partitioned
+// its voxels would need three pieces for it. The bars are 1 m wide, so the tolerance has to be well under
+// that for the two-bar cover to be the tighter answer; at a coarse tolerance the cover is still a cover,
+// but hulls bloated by their own voxels split it differently.
+void CrossingBarsCoverEachOther(IVHACD& v)
+{
+    Mesh plus = Box(3, 1, 0.4);
+    const Mesh upright = Box(1, 3, 0.4);
+    const uint32_t offset = uint32_t(plus.points.size() / 3);
+    for (size_t i = 0; i < upright.points.size(); i += 3)
+    {
+        plus.points.push_back(upright.points[i] + 1.0);
+        plus.points.push_back(upright.points[i + 1]);
+        plus.points.push_back(upright.points[i + 2]);
+    }
+    for (const uint32_t index : upright.triangles)
+    {
+        plus.triangles.push_back(index + offset);
+    }
+    for (size_t i = 0; i < offset * 3; i += 3)
+    {
+        plus.points[i + 1] += 1.0;
+    }
+
+    IVHACD::Parameters p = DefaultParams();
+    p.m_maxConvexHulls = 32;
+    p.m_relativeTolerance = 0.01;
+    p.m_minTolerance = 0.01;
+    p.m_maxTolerance = 0.03;
+    p.m_probeRadius = 0.05;
+    CHECK(Run(v, plus, p) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 2);
+
+    // Each hull spans one bar, so between them they overlap where the bars cross.
+    for (uint32_t i = 0; i < v.GetNConvexHulls(); ++i)
+    {
+        IVHACD::ConvexHull hull;
+        v.GetConvexHull(i, hull);
+        double low[3] = {1e30, 1e30, 1e30};
+        double high[3] = {-1e30, -1e30, -1e30};
+        for (const VHACD::Vertex& q : hull.m_points)
+        {
+            const double c[3] = {q.mX, q.mY, q.mZ};
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                low[axis] = std::min(low[axis], c[axis]);
+                high[axis] = std::max(high[axis], c[axis]);
+            }
+        }
+        const bool spansX = high[0] - low[0] > 2.5 && high[1] - low[1] < 1.5;
+        const bool spansY = high[1] - low[1] > 2.5 && high[0] - low[0] < 1.5;
+        CHECK(spansX || spansY);
+    }
+}
+
 // Budgets bound the work rather than the quality, and say so.
 void BudgetsAreReported(IVHACD& v)
 {
@@ -301,9 +356,146 @@ void BudgetsAreReported(IVHACD& v)
     CHECK(v.GetReport().m_voxelCount <= coarse.m_maxVoxels);
 }
 
+// Every hull carries a bounding box and an id alongside its points. The merge phase rebuilds both, so they
+// are checked against the points they claim to describe.
+void HullBoxesAndIdsDescribeTheirPoints(IVHACD& v)
+{
+    IVHACD::Parameters p = DefaultParams();
+    p.m_maxConvexHulls = 8;
+    CHECK(Run(v, LShape(), p) == Result::Completed);
+    CHECK(v.GetNConvexHulls() > 1);
+
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < v.GetNConvexHulls(); ++i)
+    {
+        IVHACD::ConvexHull hull;
+        CHECK(v.GetConvexHull(i, hull));
+        CHECK(!hull.m_points.empty());
+        for (const VHACD::Vertex& q : hull.m_points)
+        {
+            CHECK(q.mX >= hull.mBmin.GetX() && q.mX <= hull.mBmax.GetX());
+            CHECK(q.mY >= hull.mBmin.GetY() && q.mY <= hull.mBmax.GetY());
+            CHECK(q.mZ >= hull.mBmin.GetZ() && q.mZ <= hull.mBmax.GetZ());
+        }
+        // The box is the points' box, not merely a box containing them.
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            double low = std::numeric_limits<double>::max();
+            double high = -std::numeric_limits<double>::max();
+            for (const VHACD::Vertex& q : hull.m_points)
+            {
+                const double c[3] = {q.mX, q.mY, q.mZ};
+                low = std::min(low, c[axis]);
+                high = std::max(high, c[axis]);
+            }
+            CHECK(low == hull.mBmin[axis] && high == hull.mBmax[axis]);
+        }
+        CHECK(hull.m_center.GetX() >= hull.mBmin.GetX() && hull.m_center.GetX() <= hull.mBmax.GetX());
+        ids.push_back(hull.m_meshId);
+    }
+    std::sort(ids.begin(), ids.end());
+    CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+
+    // A hull past the last one is not a hull, and leaves its argument alone.
+    IVHACD::ConvexHull untouched;
+    CHECK(!v.GetConvexHull(v.GetNConvexHulls(), untouched));
+    CHECK(untouched.m_points.empty() && untouched.m_triangles.empty());
+}
+
+// A Compute that produced nothing must not leave the previous one's report behind, where it would read as
+// a description of the call that was refused.
+void RejectedComputeLeavesNoReport(IVHACD& v)
+{
+    CHECK(Run(v, LShape(), DefaultParams()) == Result::Completed);
+    CHECK(v.GetNConvexHulls() > 0 && v.GetReport().m_voxelCount > 0);
+
+    IVHACD::Parameters bad = DefaultParams();
+    bad.m_maxPieces = 1;
+    bad.m_maxConvexHulls = 8;
+    CHECK(Run(v, LShape(), bad) == Result::InvalidInput);
+    CHECK(v.GetNConvexHulls() == 0);
+    CHECK(v.GetReport().m_voxelCount == 0);
+    CHECK(v.GetReport().m_tolerance == 0 && v.GetReport().m_voxelSize == 0);
+    CHECK(v.GetReport().m_pieceCount == 0 && v.GetReport().m_protectedVoxels == 0);
+    CHECK(!v.GetReport().m_hullBudgetBound && !v.GetReport().m_voxelBudgetBound
+          && !v.GetReport().m_pieceBudgetBound);
+}
+
 // The decomposition rests on one question: does this hull contain a voxel it may not? The scan that
 // answers it walks columns and clips a line against the faces, so it is checked here against the
 // definition itself, evaluated over every voxel centre and every face.
+// The probe-radius closing and the far-voxel test both rest on one exact distance transform, computed
+// separably per axis as the lower envelope of parabolas. That is the subtle part of the whole design, so it
+// is checked against the definition it implements: for every voxel, the squared distance to the nearest seed
+// found by looking at all of them.
+void DistanceTransformMatchesNearestSeed()
+{
+    std::mt19937 rng(20260917);
+    const VHACD::Vector3<uint32_t> shapes[] = {
+        VHACD::Vector3<uint32_t>(1, 1, 1),  VHACD::Vector3<uint32_t>(9, 4, 6),
+        VHACD::Vector3<uint32_t>(1, 12, 1), VHACD::Vector3<uint32_t>(7, 7, 7),
+        VHACD::Vector3<uint32_t>(13, 2, 5),
+    };
+    for (const VHACD::Vector3<uint32_t>& dim : shapes)
+    {
+        const size_t count = size_t(dim[0]) * dim[1] * dim[2];
+        // Densities from "one seed" to "almost all seeds", and one grid with no seed at all.
+        for (const int percent : {0, 3, 15, 50, 97})
+        {
+            std::vector<uint8_t> seeds(count, 0);
+            std::uniform_int_distribution<int> roll(1, 100);
+            for (size_t i = 0; i < count; ++i)
+            {
+                seeds[i] = roll(rng) <= percent ? 1 : 0;
+            }
+            std::vector<size_t> seedIndices;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (seeds[i])
+                {
+                    seedIndices.push_back(i);
+                }
+            }
+
+            std::vector<int32_t> field;
+            VHACD::SquaredDistanceTransform(dim, seeds, field);
+            CHECK(field.size() == count);
+
+            // The grid is stored the way Volume::GetVoxel indexes it: k + j*dimZ + i*dimY*dimZ.
+            const auto coords = [&dim](const size_t index, int32_t& x, int32_t& y, int32_t& z)
+            {
+                z = int32_t(index % dim[2]);
+                y = int32_t((index / dim[2]) % dim[1]);
+                x = int32_t(index / (size_t(dim[2]) * dim[1]));
+            };
+            const int32_t span = int32_t(dim[0]) * int32_t(dim[0]) + int32_t(dim[1]) * int32_t(dim[1])
+                                 + int32_t(dim[2]) * int32_t(dim[2]);
+            for (size_t i = 0; i < count; ++i)
+            {
+                int32_t x = 0, y = 0, z = 0;
+                coords(i, x, y, z);
+                int32_t nearest = std::numeric_limits<int32_t>::max();
+                for (const size_t s : seedIndices)
+                {
+                    int32_t sx = 0, sy = 0, sz = 0;
+                    coords(s, sx, sy, sz);
+                    const int32_t d = (x - sx) * (x - sx) + (y - sy) * (y - sy) + (z - sz) * (z - sz);
+                    nearest = std::min(nearest, d);
+                }
+                if (seedIndices.empty())
+                {
+                    // Nothing to be near: the distance only has to exceed anything the grid can span.
+                    CHECK(field[i] > span);
+                }
+                else
+                {
+                    CHECK(field[i] == nearest);
+                }
+            }
+        }
+    }
+}
+
 void HullSpaceTestMatchesBruteForce()
 {
     // A solid slab with a notch cut out of it, voxelized by hand.
@@ -503,12 +695,17 @@ void EveryPieceHasVolume(IVHACD& v)
 
 void CancelFromUpdateStopsAndReleasesResults(IVHACD& v)
 {
+    // Start from a completed run, so anything left behind is the previous run's and not an empty slate.
+    CHECK(Run(v, LShape(), DefaultParams()) == Result::Completed);
+    CHECK(v.GetNConvexHulls() > 0 && v.GetReport().m_voxelCount > 0);
+
     IVHACD::Parameters p = DefaultParams();
     CancelOnFirstUpdate cancel;
     cancel.target = &v;
     p.m_callback = &cancel;
     CHECK(Run(v, LShape(), p) == Result::Canceled);
     CHECK(v.GetNConvexHulls() == 0);
+    CHECK(v.GetReport().m_voxelCount == 0 && v.GetReport().m_tolerance == 0);
 }
 
 void ReusedInstanceReproducesResults(IVHACD& v)
@@ -914,9 +1111,13 @@ int main()
     RotatedCubeRemainsOneHull(*v);
     ToleranceDecidesHullCount(*v);
     ProbeRadiusFillsNarrowGaps(*v);
+    CrossingBarsCoverEachOther(*v);
     BudgetsAreReported(*v);
+    HullBoxesAndIdsDescribeTheirPoints(*v);
+    RejectedComputeLeavesNoReport(*v);
     LimitedHullKeepsFarthestPoints();
     FaceOrientationSignIsExact();
+    DistanceTransformMatchesNearestSeed();
     HullSpaceTestMatchesBruteForce();
     v->Release();
 

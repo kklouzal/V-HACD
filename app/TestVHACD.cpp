@@ -154,7 +154,7 @@ int main(int argc,const char **argv)
 		printf("-x <maxTolerance>       : Largest tolerance in model units. Default is 0.03\n");
 		printf("-t <probeRadius>        : Gaps and pockets a sphere of this radius cannot enter are filled. Default is 0.05\n");
 		printf("-r <maxVoxels>          : Voxel budget; a coarser grid, and tolerance, is used when it binds. Default is 524,288\n");
-		printf("-d <maxPieces>          : Piece budget: splitting stops here even where a piece reaches too far. Default is 512\n");
+		printf("-d <maxPieces>          : Piece budget: splitting stops here even where a piece reaches too far. At least -h. Default is 512\n");
 		printf("-s <true/false>         : Whether or not to shrinkwrap output to source mesh. Default is true.\n");
 		printf("-f <fillMode>           : Fill mode. Default is 'flood', also 'surface' and 'raycast' are valid.\n");
 		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 32\n");
@@ -374,18 +374,56 @@ int main(int argc,const char **argv)
 				completed = iface->Compute(points,w.mVertexCount,w.mIndices,w.mTriCount,p) == VHACD::IVHACD::ComputeResult::Completed;
 				logging.flushMessages();
 			}
+			if ( completed )
+			{
+				// The tolerance and the hull count are outcomes of the input, so say what they came out as.
+				const VHACD::IVHACD::Report &report = iface->GetReport();
+				printf("%u hulls within %0.1f mm of the surface (probe %0.1f mm, %u pieces)\n",
+					iface->GetNConvexHulls(), report.m_tolerance*1000, report.m_probeRadius*1000, report.m_pieceCount);
+				printf("Grid: %u voxels of %0.1f mm, %llu of them space no hull may cover\n",
+					report.m_voxelCount, report.m_voxelSize*1000, (unsigned long long)report.m_protectedVoxels);
+				if ( report.m_voxelBudgetBound )
+				{
+					printf("Note: the voxel budget (-r) forced a coarser tolerance than asked for; raise it for a tighter fit\n");
+				}
+				if ( report.m_probeRadius > p.m_probeRadius )
+				{
+					// A probe smaller than a couple of voxels cannot be told from one that fits through the gap.
+					printf("Note: the probe (-t) was raised from %0.1f mm to two voxels; a finer tolerance keeps it where you set it\n",
+						p.m_probeRadius*1000);
+				}
+				if ( report.m_pieceBudgetBound )
+				{
+					printf("Note: the piece budget (-d) stopped the splitting; a piece may stand off further than the tolerance\n");
+				}
+				if ( report.m_hullBudgetBound )
+				{
+					printf("Note: the hull budget (-h) merged hulls past the tolerance; raise it for a tighter fit\n");
+				}
+			}
 			if ( completed && iface->GetNConvexHulls() )
 			{
+				// The per-hull files are named after the input mesh. Only its name is used, not the path it
+				// came from, so they land in the working directory beside decomp.obj rather than in the
+				// directory the mesh was read from.
 				const char *fname = argv[1];
+				for (const char *scan = argv[1]; *scan; ++scan)
+				{
+					if ( *scan == '/' || *scan == '\\' )
+					{
+						fname = scan + 1;
+					}
+				}
 				const char *dot = lastDot(fname);
 				std::string baseName;
-				if ( dot )
+				while ( *fname && fname != dot )
 				{
-					while ( fname != dot )
-					{
-						baseName.push_back(*fname);
-						fname++;
-					}
+					baseName.push_back(*fname);
+					fname++;
+				}
+				if ( baseName.empty() )
+				{
+					baseName = "hull";
 				}
 
 				char outputName[2048];

@@ -133,8 +133,13 @@ without building anything; without those three tests a passenger coach takes 17.
 - `ConvexHull::m_center` is the hull's center of mass as a solid.
 - A contract test suite (`test/ContractTests.cpp`) covers typed results, validation, cancellation, instance reuse,
   centroids, hull reduction, what the tolerance, probe radius and budgets promise, a rod too thin for the hull
-  builder keeping its collision, a mesh with no extent, settings no grid can satisfy, the orientation test against
-  exact integer arithmetic, and the space test against its own definition over every voxel of a grid.
+  builder keeping its collision, a mesh with no extent, settings no grid can satisfy, a plus sign covered by two
+  crossing bars, each hull's bounding box and id against its own points, a refused `Compute` leaving no report
+  behind, the orientation test against exact integer arithmetic, and the space test against its own definition
+  over every voxel of a grid.
+- The distance transform the tolerance and the probe both rest on is checked against the definition it
+  implements — for every voxel, the nearest seed found by looking at all of them — over random grids from
+  1×1×1 to 7×7×7, at densities from empty to nearly solid.
 
 ### Built for engines
 
@@ -252,7 +257,7 @@ Lengths are in the units of the input, so a mesh in metres takes metres.
 | `m_probeRadius` | 0.05 | Gaps, openings and pockets a sphere of this radius cannot enter from outside are filled, as are sealed cavities. 0 keeps every reachable pocket. |
 | `m_maxVoxels` | 524288 | Voxel budget. Where it binds, the voxel size and the tolerance are coarsened together and the report says so. |
 | `m_maxConvexHulls` | 64 | Hull budget. Hulls merge past the tolerance only to meet it, which the report records. |
-| `m_maxPieces` | 512 | Piece budget: splitting stops here even where a piece still reaches too far. |
+| `m_maxPieces` | 512 | Piece budget: splitting stops here even where a piece still reaches too far. At least `m_maxConvexHulls`. |
 | `m_maxNumVerticesPerCH` | 32 | Maximum vertices per hull, at least 4. Larger hulls keep their farthest points first. |
 | `m_shrinkWrap` | true | Moves hull vertices within one voxel of the source mesh onto it. |
 | `m_fillMode` | `FLOOD_FILL` | How the interior is found: `FLOOD_FILL` for closed meshes, `RAYCAST_FILL` for meshes with holes, `SURFACE_ONLY` for hollow results. |
@@ -306,6 +311,8 @@ TestVHACD app/meshes/bunny.obj -e 0.01 -t 0.05 -h 32 -v 44 -o obj
 
 ## Migrating from upstream 4.x
 
+- The header defines `VHACD_FORK_KKLOUZAL`. `VHACD_VERSION_MAJOR`/`MINOR` stay at the 4.1 they were forked
+  from, so code that must compile against either should test for this macro rather than the version.
 - `Compute` returns `IVHACD::ComputeResult`. Compare with `ComputeResult::Completed` where you tested the `bool`.
 - Asynchronous computation is gone: `CreateVHACD_ASYNC`, `IsReady`, `IUserCallback::NotifyVHACDComplete`,
   `IUserTaskRunner`, `m_taskRunner` and `m_asyncACD`. Call `Compute` from your own worker thread.
@@ -322,7 +329,8 @@ TestVHACD app/meshes/bunny.obj -e 0.01 -t 0.05 -h 32 -v 44 -o obj
   surface.
 - Only exactly coincident vertices are welded.
 - `TestVHACD` lost `-a` (asynchronous), `-p` (best plane) and `-l`, and its `-e`, `-r`, `-d` and `-t` now mean
-  tolerance, voxel budget, piece budget and probe radius.
+  tolerance, voxel budget, piece budget and probe radius. It prints the report after each run, and `-o` writes
+  its per-hull files into the working directory rather than beside the input mesh.
 - The library needs C++17 and SSE2.
 
 ## Limitations

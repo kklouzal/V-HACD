@@ -29,64 +29,15 @@
 
 #    define VHACD_VERSION_MAJOR 4
 #    define VHACD_VERSION_MINOR 1
+// The API differs from upstream 4.1; see the note below.
+#    define VHACD_FORK_KKLOUZAL 1
 
-// Changes for version 4.1
-//
-// Various minor tweaks mostly to the test application and some default values.
-
-// Changes for version 4.0
-//
-// * The code has been significantly refactored to be cleaner and easier to maintain
-//      * All OpenCL related code removed
-//      * All Bullet code removed
-//      * All SIMD code removed
-//      * Old plane splitting code removed
-//
-// * The code is now delivered as a single header file 'VHACD.h' which has both the API
-// * declaration as well as the implementation.  Simply add '#define ENABLE_VHACD_IMPLEMENTATION 1'
-// * to any CPP in your application prior to including 'VHACD.h'. Only do this in one CPP though.
-// * If you do not have this define once, you will get link errors since the implementation code
-// * will not be compiled in. If you have this define more than once, you are likely to get
-// * duplicate symbol link errors.
-//
-// * Since the library is now delivered as a single header file, we do not provide binaries
-// * or build scripts as these are not needed.
-//
-// * The old DebugView and test code has all been removed and replaced with a much smaller and
-// * simpler test console application with some test meshes to work with.
-//
-// * The convex hull generation code has changed. The previous version came from Bullet.
-// * However, the new version is courtesy of Julio Jerez, the author of the Newton
-// * physics engine. His new version is faster and more numerically stable.
-//
-// * The code can now detect if the input mesh is, itself, already a convex object and
-// * can early out.
-//
-// * Significant performance improvements have been made to the code and it is now much
-// * faster, stable, and is easier to tune than previous versions.
-//
-// * A bug was fixed with the shrink wrapping code (project hull vertices) that could
-// * sometime produce artifacts in the results. The new version uses a 'closest point'
-// * algorithm that is more reliable.
-//
-// * You can now select which 'fill mode' to use. For perfectly closed meshes, the default
-// * behavior using a flood fill generally works fine. However, some meshes have small
-// * holes in them and therefore the flood fill will fail, treating the mesh as being
-// * hollow. In these cases, you can use the 'raycast' fill option to determine which
-// * parts of the voxelized mesh are 'inside' versus being 'outside'. Finally, there
-// * are some rare instances where a user might actually want the mesh to be treated as
-// * hollow, in which case you can pass in 'surface' only.
-// *
-// * A new optional virtual interface called 'IUserProfiler' was provided.
-// * This allows the user to provide an optional profiling callback interface to assist in
-// * diagnosing performance issues. This change was made by Danny Couture at Epic for the UE4 integration.
-// * Some profiling macros were also declared in support of this feature.
-// *
-// * Another new optional virtual interface called 'IUserTaskRunner' was provided.
-// * This interface is used to run logical 'tasks' in a background thread. If none is provided
-// * then a default implementation using std::thread will be executed.
-// * This change was made by Danny Couture at Epic to speed up the voxelization step.
-// *
+// This is a fork. The decomposition is driven by an accuracy tolerance rather than by a hull count:
+// the caller says how far a hull may stand off the surface and how narrow a gap should be treated as
+// solid, and the number of hulls follows from the shape. IVHACD::Report says what was used.
+// README.md states the contract; VHACD_FORK_KKLOUZAL distinguishes this header from upstream 4.1,
+// whose m_resolution, m_maxRecursionDepth, m_minimumVolumePercentErrorAllowed and m_minEdgeLength
+// parameters it does not have.
 
 
 
@@ -447,6 +398,7 @@ public:
 
     /**
     * Returns what the last Compute used: its tolerance, voxel size and whether a budget constrained it.
+    * A Compute that returned Canceled or InvalidInput leaves it zeroed, as it leaves the hulls empty.
     */
     virtual const Report& GetReport() const = 0;
 
@@ -6273,6 +6225,10 @@ void VHACDImpl::Clean()
     // The grid and its distance fields are the largest allocation of a Compute; release them too.
     m_voxelize = VHACD::Volume();
     m_space = VHACD::SpaceModel();
+
+    // The report describes the results, so it goes with them; a rejected or canceled Compute must not
+    // leave the previous one's tolerance and counts behind to be read as its own.
+    m_report = Report();
 }
 
 void VHACDImpl::Release()
@@ -6287,7 +6243,6 @@ IVHACD::ComputeResult VHACDImpl::Compute(const std::vector<VHACD::Vertex>& point
     m_params = params;
     m_canceled = false;
     m_progressTimer.Reset();
-    m_report = Report();
 
     CopyInputMesh(points,
                   triangles);
