@@ -1853,6 +1853,33 @@ HullPlane ConvexHullFace::GetPlaneEquation(const std::vector<VHACD::Vect3>& poin
     return plane;
 }
 
+// Orders points by x, then y, then z. Coordinates are finite (Compute validates its input), so this is a strict weak
+// order. ConvexHull sorts its input this way, and inputs already in this order skip the sort.
+inline bool LexicographicallyLess(const VHACD::Vect3& a, const VHACD::Vect3& b)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        if (a[i] != b[i])
+        {
+            return a[i] < b[i];
+        }
+    }
+    return false;
+}
+
+inline bool LexicographicallyLess(const VHACD::Vertex& a, const VHACD::Vertex& b)
+{
+    if (a.mX != b.mX)
+    {
+        return a.mX < b.mX;
+    }
+    if (a.mY != b.mY)
+    {
+        return a.mY < b.mY;
+    }
+    return a.mZ < b.mZ;
+}
+
 class ConvexHullVertex : public VHACD::Vect3
 {
 public:
@@ -2075,16 +2102,8 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
 
 void ConvexHull::GetUniquePoints(std::vector<ConvexHullVertex>& points)
 {
-    // Coordinates are finite (Compute validates its input), so this is a strict weak order.
     const auto lexicographicLess = [](const ConvexHullVertex& a, const ConvexHullVertex& b) {
-        for (int i = 0; i < 3; i++)
-        {
-            if (a[i] != b[i])
-            {
-                return a[i] < b[i];
-            }
-        }
-        return false;
+        return LexicographicallyLess(a, b);
     };
     const auto samePosition = [](const ConvexHullVertex& a, const ConvexHullVertex& b) {
         return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
@@ -5062,6 +5081,14 @@ public:
     std::unique_ptr<ConvexHull> ComputeCombinedConvexHull(const ConvexHull& sm1,
                                                           const ConvexHull& sm2);
 
+    // The volume of the hull ComputeCombinedConvexHull would build, with the same arithmetic, without building it
+    double ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
+                                           const ConvexHull& sm2);
+
+    // The points of both live hulls, merged in lexicographic order
+    std::vector<VHACD::Vertex> MergeHullPoints(const ConvexHull& sm1,
+                                               const ConvexHull& sm2) const;
+
     // Returns the live hull with this id, or nullptr once it has been merged away
     ConvexHull* GetHull(uint32_t id);
 
@@ -5107,6 +5134,9 @@ public:
     // Hulls being merged, indexed by id. A merged-away hull leaves a null entry, so iterating the
     // table visits live hulls in creation order.
     std::vector<std::unique_ptr<IVHACD::ConvexHull>>    m_hulls;
+    // The points of each hull in m_hulls in lexicographic order, so a combined hull's input is a linear merge that
+    // ConvexHull does not sort again. Empty for merged-away hulls.
+    std::vector<std::vector<VHACD::Vertex>>             m_sortedHullPoints;
     size_t                                              m_liveHullCount{ 0 };
 };
 
@@ -5246,6 +5276,7 @@ void VHACDImpl::Clean()
 {
     m_convexHulls.clear();
     m_hulls.clear();
+    m_sortedHullPoints.clear();
     m_liveHullCount = 0;
     // Pairs refer to hull ids, which a later Compute reuses.
     m_hullPairQueue = std::priority_queue<HullPair>();
@@ -5533,6 +5564,7 @@ void VHACDImpl::PerformConvexDecomposition()
     if ( !m_canceled )
     {
         m_hulls.clear();
+        m_sortedHullPoints.clear();
         m_liveHullCount = 0;
 
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
@@ -5726,6 +5758,7 @@ void VHACDImpl::PerformConvexDecomposition()
                 m_convexHulls.push_back(std::move(hull));
             }
             m_hulls.clear();
+            m_sortedHullPoints.clear();
             m_liveHullCount = 0;
             ProgressUpdate(Stages::FINALIZING_RESULTS,
                            100,
@@ -5821,9 +5854,8 @@ void VHACDImpl::PerformMergeCostTask(CostTask& mt)
     double volume1 = ch1->m_volume;
     double volume2 = ch2->m_volume;
 
-    const std::unique_ptr<ConvexHull> combined = ComputeCombinedConvexHull(*ch1,
-                                                                           *ch2); // Build the combined convex hull
-    double combinedVolume = ComputeConvexHullVolume(*combined); // get the combined volume
+    double combinedVolume = ComputeCombinedConvexHullVolume(*ch1,
+                                                            *ch2);
     mt.m_concavity = ComputeConcavity(volume1 + volume2,
                                       combinedVolume,
                                       m_overallHullVolume);
@@ -5859,17 +5891,57 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeReducedConvexHull(const Co
     return ret;
 }
 
+std::vector<VHACD::Vertex> VHACDImpl::MergeHullPoints(const ConvexHull& sm1,
+                                                      const ConvexHull& sm2) const
+{
+    const std::vector<VHACD::Vertex>& points1 = m_sortedHullPoints[sm1.m_meshId];
+    const std::vector<VHACD::Vertex>& points2 = m_sortedHullPoints[sm2.m_meshId];
+    assert(points1.size() == sm1.m_points.size() && points2.size() == sm2.m_points.size());
+    std::vector<VHACD::Vertex> vertices(points1.size() + points2.size());
+    std::merge(points1.begin(),
+               points1.end(),
+               points2.begin(),
+               points2.end(),
+               vertices.begin(),
+               [](const VHACD::Vertex& a, const VHACD::Vertex& b) { return LexicographicallyLess(a, b); });
+    return vertices;
+}
+
+double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
+                                                  const ConvexHull& sm2)
+{
+    const std::vector<VHACD::Vertex> vertices = MergeHullPoints(sm1,
+                                                                sm2);
+    const VHACD::ConvexHull hull(vertices,
+                                 double(0.0001),
+                                 int(vertices.size()));
+
+    // ComputeConvexHullVolume over the points and faces QuickHull would copy out, in the same order.
+    const std::vector<VHACD::Vect3>& points = hull.GetVertexPool();
+    VHACD::Vect3 bary(0, 0, 0);
+    for (const VHACD::Vect3& p : points)
+    {
+        bary += p;
+    }
+    bary /= double(points.size());
+
+    double totalVolume = 0;
+    for (const VHACD::ConvexHullFace& face : hull.GetFaces())
+    {
+        totalVolume += ComputeVolume4(points[face.m_index[0]],
+                                      points[face.m_index[1]],
+                                      points[face.m_index[2]],
+                                      bary);
+    }
+    return totalVolume / double(6.0);
+}
+
 std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
                                                                          const ConvexHull& sm2)
 {
-    uint32_t vcount = uint32_t(sm1.m_points.size() + sm2.m_points.size()); // Total vertices from both hulls
-    std::vector<VHACD::Vertex> vertices(vcount);
-    auto it = std::copy(sm1.m_points.begin(),
-                        sm1.m_points.end(),
-                        vertices.begin());
-    std::copy(sm2.m_points.begin(),
-                sm2.m_points.end(),
-                it);
+    std::vector<VHACD::Vertex> vertices = MergeHullPoints(sm1,
+                                                          sm2);
+    uint32_t vcount = uint32_t(vertices.size()); // Total vertices from both hulls
 
     VHACD::QuickHull qh;
     qh.ComputeConvexHull(vertices,
@@ -5897,6 +5969,11 @@ IVHACD::ConvexHull* VHACDImpl::GetHull(uint32_t id)
 IVHACD::ConvexHull* VHACDImpl::AddHull(std::unique_ptr<ConvexHull> hull)
 {
     hull->m_meshId = uint32_t(m_hulls.size());
+    std::vector<VHACD::Vertex> sorted = hull->m_points;
+    std::sort(sorted.begin(),
+              sorted.end(),
+              [](const VHACD::Vertex& a, const VHACD::Vertex& b) { return LexicographicallyLess(a, b); });
+    m_sortedHullPoints.push_back(std::move(sorted));
     m_hulls.push_back(std::move(hull));
     ++m_liveHullCount;
     return m_hulls.back().get();
@@ -5906,6 +5983,7 @@ void VHACDImpl::RemoveHull(uint32_t id)
 {
     assert(id < m_hulls.size() && m_hulls[id]);
     m_hulls[id].reset();
+    std::vector<VHACD::Vertex>().swap(m_sortedHullPoints[id]);
     --m_liveHullCount;
 }
 
