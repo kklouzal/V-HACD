@@ -841,7 +841,6 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 #include <chrono>
 #include <limits>
 #include <memory>
-#include <new>
 #include <queue>
 #include <unordered_map>
 #include <utility>
@@ -7003,6 +7002,7 @@ double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
 
 std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::SimplifyHull(const ConvexHull& source)
 {
+    assert(!source.m_points.empty());
     if ( source.m_points.size() < 4 )
     {
         return source.m_triangles.empty() ? BoxHullOfPoints(source.m_points)
