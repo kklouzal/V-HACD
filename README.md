@@ -10,7 +10,7 @@ collision. One header, C++17, no dependencies.
 This is a maintained fork of [kmammou/v-hacd](https://github.com/kmammou/v-hacd) 4.1, which is archived. It keeps
 the algorithm but not its central assumption: you no longer ask for a number of hulls. You ask for an accuracy,
 and the hull count follows from the shape. On a corpus of 611 game models that is **half as many hulls** as
-upstream, **less than a third as much uncovered surface**, and **5.1x faster**.
+upstream, **less than a quarter as much uncovered surface**, and **6x faster**.
 
 ![Approximate convex decomposition of a camel](doc/acd.png)
 
@@ -22,23 +22,23 @@ diagonal, between 1 and 3 cm, with a 5 cm probe), on the same 611 inputs, one th
 
 |                                                        | Upstream 4.1 | This fork    |
 | ------------------------------------------------------ | -----------: | -----------: |
-| Hulls per model                                        | 30.1         | **14.4**     |
-| Hull faces per model                                   | 789          | **297**      |
-| Models that came out as one hull                       | 10           | **82**       |
-| Models that hit the 32-hull cap                        | 550          | **117**      |
-| Source surface more than 1 cm outside every hull       | 3.37%        | **0.87%**    |
-| Source surface more than 5 cm outside every hull       | 2.24%        | **0.47%**    |
-| Hull surface standing off the source, 95th percentile  | 2.99 m       | **1.70 m**   |
+| Hulls per model                                        | 30.1         | **14.5**     |
+| Hull faces per model                                   | 789          | **307**      |
+| Models that came out as one hull                       | 10           | **81**       |
+| Models that hit the 32-hull cap                        | 550          | **116**      |
+| Source surface more than 1 cm outside every hull       | 3.37%        | **0.77%**    |
+| Source surface more than 5 cm outside every hull       | 2.24%        | **0.36%**    |
+| Hull surface standing off the source, 95th percentile  | 2.99 m       | **1.69 m**   |
 | Models decomposed into no hulls at all                 | 3            | **0**        |
-| Total decomposition time                               | 203 s        | **37 s**     |
-| Median model                                           | 195 ms       | **44 ms**    |
+| Total decomposition time                               | 203 s        | **34 s**     |
+| Median model                                           | 195 ms       | **42 ms**    |
 | 95th percentile model                                  | 815 ms       | **163 ms**   |
-| Slowest model                                          | 4.26 s       | **349 ms**   |
+| Slowest model                                          | 4.26 s       | **250 ms**   |
 
 Every model's uncovered surface stays inside the accuracy it was asked for, at the 99th percentile, on all 611.
 The corpus is mostly large environment geometry, which is why those distances are in metres; on 61 props (glTF
 sample assets and game props under 10 m) the same comparison against the fork's own previous, count-driven
-revision is 15.3 hulls per model instead of 26.4, with hull surfaces standing 90 mm off the source at the 95th
+revision is 15.3 hulls per model instead of 26.4, with hull surfaces standing 92 mm off the source at the 95th
 percentile instead of 152 mm.
 
 ## How it decides
@@ -67,6 +67,9 @@ everything, while a wide shallow dish has plenty and blocks nothing. A count is 
 corpus, models under 10 m needed a median of 2 hulls to reach the accuracy their grid could offer and were given
 21.8, while 14 of 159 needed more than the 32 they were allowed.
 
+A hull the builder refuses, which it does for a cloud too thin for its length whatever its voxels say, takes the
+box around its voxels rather than disappearing: a rod 500 m long and 1 mm thick keeps its collision.
+
 The fork measures distance instead, on the voxel grid it already builds:
 
 1. The solid is closed by the probe: three exact integer distance transforms (Meijster, Roerdink and Hesselink)
@@ -79,7 +82,7 @@ The fork measures distance instead, on the voxel grid it already builds:
 ### Faster than upstream
 
 The speed came first, from work that left every output byte for byte identical, and holds up under the new
-decisions: 203 s to 37 s over the corpus, and no model slower than 349 ms.
+decisions: 203 s to 34 s over the corpus, and no model slower than 250 ms.
 
 | Change | Speed-up |
 | --- | ---: |

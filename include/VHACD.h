@@ -6844,7 +6844,10 @@ double VHACDImpl::ComputeConcavity(double volumeSeparate,
                                    double volumeCombined,
                                    double volumeMesh)
 {
-    return fabs(volumeSeparate - volumeCombined) / volumeMesh;
+    // Merge order is the only thing this feeds, and a hull of voxel corners always encloses a voxel, so
+    // the whole model's hull has volume. Should one ever not, an unranked but finite cost keeps the merge
+    // queue's ordering total rather than filling it with NaN.
+    return volumeMesh > double(0.0) ? fabs(volumeSeparate - volumeCombined) / volumeMesh : double(0.0);
 }
 
 bool VHACDImpl::DoFastCost(CostTask& mt)
