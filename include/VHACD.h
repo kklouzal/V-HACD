@@ -389,6 +389,7 @@ public:
         double      m_voxelSize{ 0 };            // Edge length of one voxel, in the units of the input
         uint32_t    m_voxelCount{ 0 };           // Voxels in the grid
         uint32_t    m_pieceCount{ 0 };           // Pieces the splitting produced, before any merging
+        uint64_t    m_protectedVoxels{ 0 };      // Voxels of reachable space no hull may cover
         bool        m_pieceBudgetBound{ false }; // Splitting stopped at m_maxPieces, so a piece may reach too far
         bool        m_voxelBudgetBound{ false }; // m_maxVoxels forced a coarser tolerance than requested
         bool        m_hullBudgetBound{ false };  // Hulls merged past the tolerance to meet m_maxConvexHulls
@@ -4769,6 +4770,7 @@ void SpaceModel::Build(const Volume& volume,
     const size_t voxelCount = dimX * dimY * dimZ;
 
     std::vector<uint8_t> mask(voxelCount, 0);
+    std::vector<uint8_t> solid(voxelCount, 0);
     std::vector<int32_t> field(voxelCount, 0);
     m_runStart.assign(dimX * dimY + 1, 0);
     m_columnSum.assign((dimX + 1) * (dimY + 1), 0);
@@ -4777,13 +4779,18 @@ void SpaceModel::Build(const Volume& volume,
     for (size_t index = 0; index < voxelCount; ++index)
     {
         const VoxelValue value = volume.m_data[index];
-        mask[index] = (value == VoxelValue::PRIMITIVE_ON_SURFACE || value == VoxelValue::PRIMITIVE_INSIDE_SURFACE) ? 1 : 0;
+        solid[index] = (value == VoxelValue::PRIMITIVE_ON_SURFACE || value == VoxelValue::PRIMITIVE_INSIDE_SURFACE) ? 1 : 0;
     }
-    SquaredDistanceTransform(m_dim, mask, field);
+    SquaredDistanceTransform(m_dim, solid, field);
 
-    // Centres where a probe sphere fits clear of every solid voxel cube, flood filled from the padded
-    // grid boundary: what the probe cannot reach from outside is filled.
-    const double clearance = probeRadius + std::sqrt(double(3.0)) * double(0.5);
+    // Centres where a probe sphere fits clear of every solid voxel cube, flood filled from the padded grid
+    // boundary: what the probe cannot reach from outside is filled. Centres sit a voxel apart, so a probe
+    // narrower than two cannot be placed where it belongs, and taking it at face value would fill gaps it
+    // plainly enters. Two voxels is also the smallest probe a grid can express, so a smaller one is taken
+    // as that, and the report says which radius was used. The grid is sized to hold the requested probe
+    // and only falls back to this where the voxel budget forced a coarser one.
+    const double probe = std::max(probeRadius, double(2.0));
+    const double clearance = probe + std::sqrt(double(3.0)) * double(0.5);
     const int32_t clearanceSquared = int32_t(std::ceil(clearance * clearance));
     std::vector<uint32_t> stack;
     std::fill(mask.begin(), mask.end(), uint8_t(0));
@@ -4823,12 +4830,14 @@ void SpaceModel::Build(const Volume& volume,
         if (k + 1 < dimZ)   visit(index + 1);
     }
 
-    // The closed solid is everything the probe sphere does not cover from those centres.
+    // The closed solid is the solid itself plus everything the probe sphere does not cover from those
+    // centres. The solid belongs to it whatever the probe covers: a ball that reaches a solid voxel's
+    // centre from a centre exactly its radius away does not make that voxel free space.
     SquaredDistanceTransform(m_dim, mask, field);
-    const int32_t probeSquared = int32_t(std::min(std::floor(probeRadius * probeRadius), double(INT32_MAX)));
+    const int32_t probeSquared = int32_t(std::min(std::floor(probe * probe), double(INT32_MAX)));
     for (size_t index = 0; index < voxelCount; ++index)
     {
-        mask[index] = field[index] > probeSquared ? 1 : 0;
+        mask[index] = (solid[index] || field[index] > probeSquared) ? 1 : 0;
     }
 
     // Far voxels: farther than the tolerance from the closed solid. A hull face can pass between voxel
@@ -6341,8 +6350,10 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
             m_tolerance = toleranceVoxels * sizing.m_voxelSize;
             m_report.m_voxelSize = sizing.m_voxelSize * m_scale;
             m_report.m_tolerance = toleranceVoxels * m_report.m_voxelSize;
-            m_report.m_probeRadius = m_params.m_probeRadius;
+            // A probe under two voxels wide is taken as two, the smallest a grid can express.
+            m_report.m_probeRadius = std::max(m_params.m_probeRadius, 2.0 * m_report.m_voxelSize);
             m_report.m_voxelCount = dim[0] * dim[1] * dim[2];
+            m_report.m_protectedVoxels = m_space.GetFarVoxelCount();
             m_report.m_voxelBudgetBound = sizing.m_budgetBound;
         }
     }

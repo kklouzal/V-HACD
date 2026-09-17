@@ -246,7 +246,8 @@ void ToleranceDecidesHullCount(IVHACD& v)
 // while the same slot keeps its two sides apart once the probe is small enough to enter it.
 void ProbeRadiusFillsNarrowGaps(IVHACD& v)
 {
-    // Two bars with a 0.1 gap between them, joined by a base so the model is one piece.
+    // A pocket 0.1 wide in the top of a block, closed on every side, so nothing outside the pocket can
+    // touch it: what decides whether it stays open is only whether the probe fits inside.
     Mesh slotted = Box(1, 1, 0.2);
     const auto append = [&slotted](const Mesh& part, const double dx, const double dy, const double dz)
     {
@@ -264,6 +265,8 @@ void ProbeRadiusFillsNarrowGaps(IVHACD& v)
     };
     append(Box(0.45, 1, 1), 0, 0, 0.2);
     append(Box(0.45, 1, 1), 0.55, 0, 0.2);
+    append(Box(0.1, 0.2, 1), 0.45, 0, 0.2);
+    append(Box(0.1, 0.2, 1), 0.45, 0.8, 0.2);
 
     IVHACD::Parameters wide = DefaultParams();
     wide.m_maxConvexHulls = 32;
