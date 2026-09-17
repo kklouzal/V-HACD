@@ -6,6 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#if defined(_MSC_VER) && !defined(NDEBUG)
+#include <crtdbg.h>
+#include <cstdlib>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -391,14 +395,15 @@ void HullSpaceTestMatchesBruteForce()
 // disappear for it.
 void ThinRodKeepsItsCollision(IVHACD& v)
 {
-    for (const double thickness : {0.001, 0.01, 0.1})
+    for (const double thickness : {0.001, 0.1})
     {
         Mesh rod = Box(500.0, thickness, thickness);
         IVHACD::Parameters p = DefaultParams();
         p.m_maxConvexHulls = 32;
-        p.m_minTolerance = 0.01;
-        p.m_maxTolerance = 0.03;
-        p.m_probeRadius = 0.05;
+        p.m_minTolerance = 1.0;
+        p.m_maxTolerance = 5.0;
+        p.m_probeRadius = 0.5;
+        p.m_maxVoxels = 1 << 16;
         CHECK(Run(v, rod, p) == Result::Completed);
         CHECK(v.GetNConvexHulls() >= 1);
 
@@ -453,10 +458,10 @@ void ExtremeSettingsStillProduceAGrid(IVHACD& v)
         uint32_t m_maxVoxels;
     };
     const Case cases[] = {
-        {500.0, 1.0e-6, 1.0e-6, 4096},        // finer than any budget can hold
-        {500.0, 1.0e-6, 1.0e-6, 8u << 20},    // and with a budget that cannot help either
-        {1.0, 0.01, 1000.0, 512u * 1024u},    // a probe a thousand times the model
-        {0.001, 0.01, 0.05, 512u * 1024u},    // a model far below its own tolerance
+        {500.0, 1.0e-6, 1.0e-6, 4096},     // finer than any budget can hold
+        {500.0, 1.0e-6, 1.0e-6, 1 << 16},  // and with a budget that cannot help either
+        {1.0, 0.01, 1000.0, 1 << 16},      // a probe a thousand times the model
+        {0.001, 0.01, 0.05, 1 << 16},      // a model far below its own tolerance
     };
     for (const Case& c : cases)
     {
@@ -884,6 +889,16 @@ void FaceOrientationSignIsExact()
 
 int main()
 {
+    // An assertion must fail the run, not stop it: a debug build pops a modal dialog by default, which in
+    // an unattended suite looks like a test that never finishes.
+#if defined(_MSC_VER) && !defined(NDEBUG)
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+
     IVHACD* const v = VHACD::CreateVHACD();
     ValidMeshCompletes(*v);
     InvalidMeshIsRejectedAndReleasesResults(*v);

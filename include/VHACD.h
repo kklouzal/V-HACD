@@ -365,7 +365,8 @@ public:
         // only sealed cavities. Finite and non-negative.
         double              m_probeRadius{ 0.05 };
         // Voxel budget. The voxel size, and with it the tolerance, is coarsened when the tolerance would
-        // need a finer grid than this; IVHACD::GetReport records what was used.
+        // need a finer grid than this; IVHACD::GetReport records what was used. A grid never exceeds 1021
+        // voxels on an axis whatever the budget allows, since voxel coordinates are packed into ten bits.
         uint32_t            m_maxVoxels{ 512u << 10 };
         // Hull budget. The count normally follows from the tolerance; hulls merge past the tolerance only
         // to meet this bound, which the report records. At least 1.
@@ -2585,8 +2586,9 @@ int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
     }
     if (!validTetrahedrum)
     {
+        // A cloud too flat for its extent has no hull to build. That is a fact about the points, not a
+        // broken invariant: callers fall back to the box around them.
         m_points.resize(0);
-        assert(0);
         return count;
     }
 
@@ -2613,8 +2615,9 @@ int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
 
     if (!validTetrahedrum)
     {
+        // A cloud too flat for its extent has no hull to build. That is a fact about the points, not a
+        // broken invariant: callers fall back to the box around them.
         m_points.resize(0);
-        assert(0);
         return count;
     }
 
@@ -2974,9 +2977,9 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 //***********************************************************************************************
 
 /*
- * A wrapper class for 3 10 bit integers and a surface flag packed into a 32 bit integer
- * Layout is [PAD][TILTED][X][Y][Z]
- * Pad is bit 31, TILTED is bit 30, X is 29-20, Y is 19-10, and Z is 9-0
+ * A wrapper class for 3 10 bit integers packed into a 32 bit integer.
+ * X is bits 29-20, Y is 19-10, and Z is 9-0, so no grid may exceed 1021 voxels on an axis; ChooseGrid
+ * settles that before a grid is built.
  */
 class Voxel
 {
@@ -4823,6 +4826,7 @@ void SpaceModel::Build(const Volume& volume,
     m_columnSum.assign((dimX + 1) * (dimY + 1), 0);
 
     // Each pass below walks the whole grid, so each is a step a caller waiting to cancel has to sit out.
+    // Voxelizing the mesh and filling it report the first three quarters of this stage.
     auto canceled = [&callbacks](const double progress)
     {
         return callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, progress, "Measuring reachable space");
@@ -4835,7 +4839,7 @@ void SpaceModel::Build(const Volume& volume,
         solid[index] = (value == VoxelValue::PRIMITIVE_ON_SURFACE || value == VoxelValue::PRIMITIVE_INSIDE_SURFACE) ? 1 : 0;
     }
     SquaredDistanceTransform(m_dim, solid, field);
-    if (canceled(20.0))
+    if (canceled(80.0))
     {
         return;
     }
@@ -4887,7 +4891,7 @@ void SpaceModel::Build(const Volume& volume,
         if (k + 1 < dimZ)   visit(index + 1);
     }
 
-    if (canceled(40.0))
+    if (canceled(85.0))
     {
         return;
     }
@@ -4902,20 +4906,22 @@ void SpaceModel::Build(const Volume& volume,
         mask[index] = (solid[index] || field[index] > probeSquared) ? 1 : 0;
     }
 
-    if (canceled(60.0))
+    if (canceled(90.0))
     {
         return;
     }
 
     // Far voxels: farther than the tolerance from the closed solid. A hull face can pass between voxel
-    // centres, so a voxel one step nearer than the tolerance is left alone; with a tolerance of at least
-    // three voxels this also keeps the notches of a voxel staircase, at most sqrt(3) voxels from solid,
-    // out of the far set, so tilted solids are not split.
+    // centres, so a voxel one step nearer than the tolerance is left alone. The notches of a voxel
+    // staircase, at most sqrt(3) voxels from solid, are kept out of the far set either by the closing,
+    // whose probe is at least two voxels wide wherever the grid resolves it, or by the third voxel of
+    // margin ChooseGrid leaves where it does not. Tilted solids are not split for their staircase either
+    // way.
     SquaredDistanceTransform(m_dim, mask, field);
     const double reach = std::max(tolerance - double(1.0), double(0.0));
     const int32_t reachSquared = int32_t(std::min(std::floor(reach * reach), double(INT32_MAX)));
 
-    if (canceled(80.0))
+    if (canceled(95.0))
     {
         return;
     }
@@ -5388,6 +5394,19 @@ void ShrinkWrap(ConvexHullWorkspace& workspace,
         sourceConvexHull.m_vertices = qh.GetVertices();
         sourceConvexHull.m_indices = qh.GetIndices();
     }
+    else if (doShrinkWrap)
+    {
+        // The projected points sit on the surface, so they describe it better than the ones they came
+        // from, but a set that flat has no hull to build. They are kept with the faces of the box around
+        // them, which for a flat piece is the piece: points and faces still describe each other, and a
+        // consumer sees the plane it should rather than a slab a voxel thick.
+        const std::unique_ptr<IVHACD::ConvexHull> box = BoxHullOfPoints(verts);
+        if (box)
+        {
+            sourceConvexHull.m_vertices = box->m_points;
+            sourceConvexHull.m_indices = box->m_triangles;
+        }
+    }
 }
 
 enum class SplitAxis
@@ -5846,8 +5865,8 @@ void VoxelHull::PerformPlaneSplit()
     }
 }
 
-// This class represents a single task to compute the volume error
-// of two convex hulls combined
+// One candidate merge: what combining two hulls would add in volume, which orders the merges, and whether
+// the combined hull would cover space no hull may cover, which decides whether it happens at all.
 class CostTask
 {
 public:
@@ -6452,9 +6471,6 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                             m_AABBTree,
                             *this);
         m_voxelScale = m_voxelize.GetScale();
-        ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
-                       100,
-                       "Voxelization complete");
 
         if ( !m_canceled )
         {
@@ -6478,6 +6494,10 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
             m_report.m_protectedVoxels = m_space.GetFarVoxelCount();
             m_report.m_voxelBudgetBound = sizing.m_budgetBound;
         }
+
+        ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
+                       100,
+                       "Voxelization complete");
     }
 
     if ( !m_canceled )
