@@ -4,11 +4,14 @@
 #define ENABLE_VHACD_IMPLEMENTATION 1
 #include "VHACD.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <random>
 #include <vector>
 
 namespace
@@ -348,6 +351,286 @@ void LimitedHullKeepsFarthestPoints()
     CHECK(keepsSpikes(limited));
 }
 
+// Exact integers for the orientation oracle: sign and magnitude in 32-bit limbs, least significant first.
+struct ExactInt
+{
+    int sign = 0;
+    std::vector<uint32_t> limbs;
+};
+
+void TrimLimbs(std::vector<uint32_t>& limbs)
+{
+    while (!limbs.empty() && limbs.back() == 0)
+    {
+        limbs.pop_back();
+    }
+}
+
+int CompareMagnitudes(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b)
+{
+    if (a.size() != b.size())
+    {
+        return a.size() < b.size() ? -1 : 1;
+    }
+    for (size_t i = a.size(); i-- > 0;)
+    {
+        if (a[i] != b[i])
+        {
+            return a[i] < b[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+ExactInt AddExact(const ExactInt& a, const ExactInt& b)
+{
+    if (a.sign == 0)
+    {
+        return b;
+    }
+    if (b.sign == 0)
+    {
+        return a;
+    }
+    ExactInt out;
+    if (a.sign == b.sign)
+    {
+        out.sign = a.sign;
+        out.limbs.assign(std::max(a.limbs.size(), b.limbs.size()) + 1, 0);
+        uint64_t carry = 0;
+        for (size_t i = 0; i < out.limbs.size(); ++i)
+        {
+            uint64_t sum = carry;
+            sum += i < a.limbs.size() ? a.limbs[i] : 0;
+            sum += i < b.limbs.size() ? b.limbs[i] : 0;
+            out.limbs[i] = uint32_t(sum);
+            carry = sum >> 32;
+        }
+        TrimLimbs(out.limbs);
+        return out;
+    }
+    const int order = CompareMagnitudes(a.limbs, b.limbs);
+    if (order == 0)
+    {
+        return out;
+    }
+    const ExactInt& larger = order > 0 ? a : b;
+    const ExactInt& smaller = order > 0 ? b : a;
+    out.sign = larger.sign;
+    out.limbs.assign(larger.limbs.size(), 0);
+    int64_t borrow = 0;
+    for (size_t i = 0; i < larger.limbs.size(); ++i)
+    {
+        int64_t difference = int64_t(larger.limbs[i]) - borrow - (i < smaller.limbs.size() ? int64_t(smaller.limbs[i]) : 0);
+        borrow = difference < 0 ? 1 : 0;
+        out.limbs[i] = uint32_t(difference + (borrow << 32));
+    }
+    TrimLimbs(out.limbs);
+    return out;
+}
+
+ExactInt SubtractExact(const ExactInt& a, ExactInt b)
+{
+    b.sign = -b.sign;
+    return AddExact(a, b);
+}
+
+ExactInt MultiplyExact(const ExactInt& a, const ExactInt& b)
+{
+    ExactInt out;
+    if (a.sign == 0 || b.sign == 0)
+    {
+        return out;
+    }
+    out.sign = a.sign * b.sign;
+    out.limbs.assign(a.limbs.size() + b.limbs.size(), 0);
+    for (size_t i = 0; i < a.limbs.size(); ++i)
+    {
+        uint64_t carry = 0;
+        for (size_t j = 0; j < b.limbs.size(); ++j)
+        {
+            const uint64_t t = uint64_t(a.limbs[i]) * b.limbs[j] + out.limbs[i + j] + carry;
+            out.limbs[i + j] = uint32_t(t);
+            carry = t >> 32;
+        }
+        for (size_t k = i + b.limbs.size(); carry != 0; ++k)
+        {
+            const uint64_t t = uint64_t(out.limbs[k]) + carry;
+            out.limbs[k] = uint32_t(t);
+            carry = t >> 32;
+        }
+    }
+    TrimLimbs(out.limbs);
+    return out;
+}
+
+// value = mantissa * 2^exponent with an integer mantissa below 2^53.
+int ExactExponent(const double value)
+{
+    int exponent;
+    std::frexp(value, &exponent);
+    return exponent - 53;
+}
+
+// value / 2^base as an exact integer; base must not exceed ExactExponent(value).
+ExactInt ExactFromDouble(const double value, const int base)
+{
+    ExactInt out;
+    if (value == 0)
+    {
+        return out;
+    }
+    int exponent;
+    const uint64_t mantissa = uint64_t(std::ldexp(std::frexp(std::fabs(value), &exponent), 53));
+    const int shift = exponent - 53 - base;
+    // A multiple of 2^base keeps its highest mantissa bit at or above bit 0 of the result.
+    const int highest = 52 + shift;
+    out.sign = value < 0 ? -1 : 1;
+    out.limbs.assign(size_t(highest / 32) + 1, 0);
+    for (int bit = 0; bit < 53; ++bit)
+    {
+        if ((mantissa >> bit) & 1)
+        {
+            const int target = bit + shift;
+            out.limbs[size_t(target / 32)] |= uint32_t(1) << (target % 32);
+        }
+    }
+    TrimLimbs(out.limbs);
+    return out;
+}
+
+// ConvexHull decides which faces a point sees by the sign of ConvexHullFace::Evalue, a 3x3 determinant of point
+// differences, and near-degenerate cases (lattice points on or next to a face plane) need that sign exactly. The
+// oracle rebuilds every double as an exact integer multiple of a common power of two and expands the determinant in
+// integers. Lattice cases have exact differences, which Evalue sums as expansions; mixed-magnitude cases have
+// rounded differences, which Evalue passes to its extended-precision fallback.
+void FaceOrientationSignIsExact()
+{
+    std::mt19937_64 rng(20260916);
+    const auto uniformInt = [&rng](const int64_t lo, const int64_t hi) {
+        return std::uniform_int_distribution<int64_t>(lo, hi)(rng);
+    };
+    std::uniform_real_distribution<double> unit(-1.0, 1.0);
+    int exactDifferenceCases = 0;
+    int roundedDifferenceCases = 0;
+    int zeroCases = 0;
+
+    const auto check = [&](const VHACD::Vect3& p0, const VHACD::Vect3& p1, const VHACD::Vect3& p2, const VHACD::Vect3& q) {
+        const std::vector<VHACD::Vect3> points = { p0, p1, p2 };
+        VHACD::ConvexHullFace face;
+        face.m_index = { 0, 1, 2 };
+        const double evalue = face.Evalue(points, q);
+        const int evalueSign = evalue > 0 ? 1 : (evalue < 0 ? -1 : 0);
+
+        int base = 0;
+        for (const VHACD::Vect3* point : { &p0, &p1, &p2, &q })
+        {
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                if ((*point)[axis] != 0)
+                {
+                    base = std::min(base, ExactExponent((*point)[axis]));
+                }
+            }
+        }
+        bool exactDifferences = true;
+        ExactInt rows[3][3];
+        const VHACD::Vect3* const others[3] = { &p2, &p1, &q };
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                rows[row][axis] = SubtractExact(ExactFromDouble((*others[row])[axis], base), ExactFromDouble(p0[axis], base));
+                const ExactInt rounded = SubtractExact(ExactFromDouble((*others[row])[axis] - p0[axis], base), rows[row][axis]);
+                exactDifferences = exactDifferences && rounded.sign == 0;
+            }
+        }
+        const ExactInt minorX = SubtractExact(MultiplyExact(rows[1][1], rows[2][2]), MultiplyExact(rows[1][2], rows[2][1]));
+        const ExactInt minorY = SubtractExact(MultiplyExact(rows[1][0], rows[2][2]), MultiplyExact(rows[1][2], rows[2][0]));
+        const ExactInt minorZ = SubtractExact(MultiplyExact(rows[1][0], rows[2][1]), MultiplyExact(rows[1][1], rows[2][0]));
+        const ExactInt det = AddExact(SubtractExact(MultiplyExact(rows[0][0], minorX), MultiplyExact(rows[0][1], minorY)),
+                                      MultiplyExact(rows[0][2], minorZ));
+        CHECK(evalueSign == det.sign);
+        exactDifferenceCases += exactDifferences ? 1 : 0;
+        roundedDifferenceCases += exactDifferences ? 0 : 1;
+        zeroCases += det.sign == 0 ? 1 : 0;
+    };
+
+    // Integer lattices scaled by powers of two: exactly coplanar points, determinants of +-1 against large entries
+    // (Cassini's identity for consecutive Fibonacci numbers), and general points.
+    for (int i = 0; i < 3000; ++i)
+    {
+        const double scale = std::ldexp(1.0, -int(uniformInt(0, 40)));
+        const int64_t origin[3] = { uniformInt(-(1 << 20), 1 << 20), uniformInt(-(1 << 20), 1 << 20), uniformInt(-(1 << 20), 1 << 20) };
+        int64_t u[3], v[3], w[3];
+        switch (i % 3)
+        {
+            case 0:
+            {
+                const int64_t a = uniformInt(-3, 3);
+                const int64_t b = uniformInt(-3, 3);
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    u[axis] = uniformInt(-1024, 1024);
+                    v[axis] = uniformInt(-1024, 1024);
+                    w[axis] = a * u[axis] + b * v[axis];
+                }
+                break;
+            }
+            case 1:
+            {
+                int64_t fibonacci[30] = { 0, 1 };
+                for (int n = 2; n < 30; ++n)
+                {
+                    fibonacci[n] = fibonacci[n - 1] + fibonacci[n - 2];
+                }
+                const int n = int(uniformInt(8, 27));
+                const int64_t zu[3] = { fibonacci[n + 1], fibonacci[n], 0 };
+                const int64_t zv[3] = { fibonacci[n], fibonacci[n - 1], 0 };
+                const int64_t zw[3] = { uniformInt(-1024, 1024), uniformInt(-1024, 1024), uniformInt(0, 1) * 2 - 1 };
+                const int rotation = int(uniformInt(0, 2));
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    u[(axis + rotation) % 3] = zu[axis];
+                    v[(axis + rotation) % 3] = zv[axis];
+                    w[(axis + rotation) % 3] = zw[axis];
+                }
+                break;
+            }
+            default:
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    u[axis] = uniformInt(-4096, 4096);
+                    v[axis] = uniformInt(-4096, 4096);
+                    w[axis] = uniformInt(-4096, 4096);
+                }
+                break;
+        }
+        const auto point = [&](const int64_t* offset) {
+            return VHACD::Vect3(double(origin[0] + (offset ? offset[0] : 0)) * scale,
+                                double(origin[1] + (offset ? offset[1] : 0)) * scale,
+                                double(origin[2] + (offset ? offset[2] : 0)) * scale);
+        };
+        check(point(nullptr), point(v), point(u), point(w));
+    }
+
+    // A tiny base point among unit-scale points makes the differences round.
+    for (int i = 0; i < 2000; ++i)
+    {
+        const VHACD::Vect3 p0(std::ldexp(unit(rng), -60), std::ldexp(unit(rng), -61), std::ldexp(unit(rng), -62));
+        const VHACD::Vect3 p1(unit(rng), unit(rng), unit(rng));
+        const VHACD::Vect3 p2(unit(rng), unit(rng), unit(rng));
+        const double alpha = unit(rng);
+        const double beta = unit(rng);
+        const VHACD::Vect3 q = p0 + (p2 - p0) * alpha + (p1 - p0) * beta;
+        check(p0, p1, p2, q);
+    }
+
+    CHECK(exactDifferenceCases >= 2500);
+    CHECK(roundedDifferenceCases >= 1500);
+    CHECK(zeroCases >= 900);
+}
+
 } // namespace
 
 int main()
@@ -364,6 +647,7 @@ int main()
     CenterIsTheSolidCentroid(*v);
     RotatedCubeRemainsOneHull(*v);
     LimitedHullKeepsFarthestPoints();
+    FaceOrientationSignIsExact();
     v->Release();
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures, g_failures == 1 ? "" : "s");

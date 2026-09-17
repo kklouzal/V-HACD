@@ -1514,6 +1514,175 @@ Googol Determinant3x3(const std::array<VHACD::Vector3<Googol>, 3>& matrix)
     return det;
 }
 
+/*
+ * Exact floating-point expansion arithmetic after J. R. Shewchuk, "Adaptive Precision Floating-Point Arithmetic and
+ * Fast Robust Geometric Predicates" (1997). An expansion is a sum of doubles in increasing order of magnitude whose
+ * nonzero terms do not overlap, so its largest term has the sign of the exact sum and is within a factor of two of
+ * it. The operations are exact for round-to-nearest double arithmetic evaluated in double precision
+ * (FLT_EVAL_METHOD 0) without reassociation (no fast-math) as long as no intermediate overflows or underflows.
+ */
+namespace ExactArithmetic
+{
+inline void TwoSum(const double a, const double b, double& sum, double& error)
+{
+    sum = a + b;
+    const double bVirtual = sum - a;
+    const double aVirtual = sum - bVirtual;
+    error = (a - aVirtual) + (b - bVirtual);
+}
+
+// Requires |a| >= |b|, or a == 0.
+inline void FastTwoSum(const double a, const double b, double& sum, double& error)
+{
+    sum = a + b;
+    error = b - (sum - a);
+}
+
+// The rounding error of difference = a - b.
+inline double TwoDiffTail(const double a, const double b, const double difference)
+{
+    const double bVirtual = a - difference;
+    const double aVirtual = difference + bVirtual;
+    return (a - aVirtual) + (bVirtual - b);
+}
+
+inline void TwoDiff(const double a, const double b, double& difference, double& error)
+{
+    difference = a - b;
+    error = TwoDiffTail(a, b, difference);
+}
+
+#if defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__))
+// A fused multiply-add returns the product's rounding error exactly. Targets with fused multiply-add are also the
+// only ones on which a compiler could fuse the separate operations of the split product below.
+inline void TwoProduct(const double a, const double b, double& product, double& error)
+{
+    product = a * b;
+    error = std::fma(a, b, -product);
+}
+#else
+// Dekker's product splits each factor into halves of 26 and 27 bits whose products are exact.
+inline void TwoProduct(const double a, const double b, double& product, double& error)
+{
+    const auto split = [](const double value, double& high, double& low) {
+        const double scaled = value * 134217729.0; // 2^27 + 1
+        high = scaled - (scaled - value);
+        low = value - high;
+    };
+    product = a * b;
+    double aHigh, aLow, bHigh, bLow;
+    split(a, aHigh, aLow);
+    split(b, bHigh, bLow);
+    const double error1 = product - (aHigh * bHigh);
+    const double error2 = error1 - (aLow * bHigh);
+    const double error3 = error2 - (aHigh * bLow);
+    error = (aLow * bLow) - error3;
+}
+#endif
+
+// (a1 + a0) - (b1 + b0) as the expansion out[0..3]; a and b are two-term expansions, most significant term first.
+inline void TwoTwoDiff(const double a1, const double a0, const double b1, const double b0, double out[4])
+{
+    double i, j, k, l;
+    TwoDiff(a0, b0, i, out[0]);
+    TwoSum(a1, i, j, k);
+    TwoDiff(k, b1, l, out[1]);
+    TwoSum(j, l, out[3], out[2]);
+}
+
+// h = e * b without zero terms; returns the length of h, at most 2 * length.
+inline int ScaleExpansionZeroElim(const int length, const double* e, const double b, double* h)
+{
+    double q, hh;
+    TwoProduct(e[0], b, q, hh);
+    int count = 0;
+    if (hh != 0.0)
+    {
+        h[count++] = hh;
+    }
+    for (int i = 1; i < length; ++i)
+    {
+        double product, productError, sum;
+        TwoProduct(e[i], b, product, productError);
+        TwoSum(q, productError, sum, hh);
+        if (hh != 0.0)
+        {
+            h[count++] = hh;
+        }
+        FastTwoSum(product, sum, q, hh);
+        if (hh != 0.0)
+        {
+            h[count++] = hh;
+        }
+    }
+    if (q != 0.0 || count == 0)
+    {
+        h[count++] = q;
+    }
+    return count;
+}
+
+// h = e + f without zero terms; returns the length of h, at most eLength + fLength.
+inline int FastExpansionSumZeroElim(const int eLength, const double* e, const int fLength, const double* f, double* h)
+{
+    int ei = 0;
+    int fi = 0;
+    // Takes the smaller-magnitude head term next.
+    const auto takeE = [&]() {
+        return fi == fLength || (ei < eLength && ((f[fi] > e[ei]) == (f[fi] > -e[ei])));
+    };
+    double q = takeE() ? e[ei++] : f[fi++];
+    int count = 0;
+    double sum, error;
+    if (ei < eLength && fi < fLength)
+    {
+        FastTwoSum(takeE() ? e[ei++] : f[fi++], q, sum, error);
+        q = sum;
+        if (error != 0.0)
+        {
+            h[count++] = error;
+        }
+    }
+    while (ei < eLength || fi < fLength)
+    {
+        TwoSum(q, takeE() ? e[ei++] : f[fi++], sum, error);
+        q = sum;
+        if (error != 0.0)
+        {
+            h[count++] = error;
+        }
+    }
+    if (q != 0.0 || count == 0)
+    {
+        h[count++] = q;
+    }
+    return count;
+}
+
+// The largest term of the exact determinant of rows a, b, c: exact in sign, within a factor of two in magnitude.
+inline double Determinant3x3Estimate(const VHACD::Vect3& a, const VHACD::Vect3& b, const VHACD::Vect3& c)
+{
+    const auto minor = [](const double p, const double q, const double r, const double s, double out[4]) {
+        double pq, pqError, rs, rsError;
+        TwoProduct(p, q, pq, pqError);
+        TwoProduct(r, s, rs, rsError);
+        TwoTwoDiff(pq, pqError, rs, rsError, out);
+    };
+    // det = a.z (b.x c.y - c.x b.y) + b.z (c.x a.y - a.x c.y) + c.z (a.x b.y - b.x a.y)
+    double bc[4], ca[4], ab[4];
+    minor(b.GetX(), c.GetY(), c.GetX(), b.GetY(), bc);
+    minor(c.GetX(), a.GetY(), a.GetX(), c.GetY(), ca);
+    minor(a.GetX(), b.GetY(), b.GetX(), a.GetY(), ab);
+    double aTerm[8], bTerm[8], cTerm[8], abTerms[16], all[24];
+    const int aLength = ScaleExpansionZeroElim(4, bc, a.GetZ(), aTerm);
+    const int bLength = ScaleExpansionZeroElim(4, ca, b.GetZ(), bTerm);
+    const int cLength = ScaleExpansionZeroElim(4, ab, c.GetZ(), cTerm);
+    const int abLength = FastExpansionSumZeroElim(aLength, aTerm, bLength, bTerm, abTerms);
+    const int allLength = FastExpansionSumZeroElim(abLength, abTerms, cLength, cTerm, all);
+    return all[allLength - 1];
+}
+} // namespace ExactArithmetic
+
 class HullPlane : public VHACD::Vect3
 {
 public:
@@ -1633,6 +1802,30 @@ double ConvexHullFace::Evalue(const std::vector<VHACD::Vect3>& pointArray,
             return double(0.0);
         }
     }
+
+#if defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD == 0 && !defined(__FAST_MATH__)
+    // Hull points are mostly voxel corners, whose coordinate differences are exact in double precision. The
+    // determinant of exact differences is then summed exactly as an expansion. On 611 inputs that covers 99% of the
+    // evaluations that reach this point; the rest go on to Googol arithmetic. Differences between 2^-200 and 2^200
+    // keep every term of the expansion clear of overflow and underflow.
+    const VHACD::Vect3* const others[3] = { &p2, &p1, &point };
+    bool exactDifferences = true;
+    for (int row = 0; row < 3 && exactDifferences; ++row)
+    {
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            const double difference = matrix[row][axis];
+            const double magnitude = fabs(difference);
+            exactDifferences = exactDifferences
+                               && (difference == 0.0 || (magnitude >= 0x1p-200 && magnitude <= 0x1p200))
+                               && ExactArithmetic::TwoDiffTail((*others[row])[axis], p0[axis], difference) == 0.0;
+        }
+    }
+    if (exactDifferences)
+    {
+        return ExactArithmetic::Determinant3x3Estimate(matrix[0], matrix[1], matrix[2]);
+    }
+#endif
 
     const VHACD::Vector3<Googol> p0g = pointArray[m_index[0]];
     const VHACD::Vector3<Googol> p1g = pointArray[m_index[1]];
