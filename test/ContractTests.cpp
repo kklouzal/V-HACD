@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <vector>
 
@@ -304,6 +305,49 @@ void CenterIsTheSolidCentroid(IVHACD& v)
     }
 }
 
+// A hull limited to fewer vertices than it has input points adds the farthest remaining point first, so
+// points far outside all the others are kept whatever order the faces were created in.
+void LimitedHullKeepsFarthestPoints()
+{
+    std::vector<VHACD::Vertex> points;
+    const double golden = 3.14159265358979323846 * (3.0 - std::sqrt(5.0));
+    for (int i = 0; i < 200; ++i)
+    {
+        const double y = 1.0 - 2.0 * (i + 0.5) / 200.0;
+        const double r = std::sqrt(1.0 - y * y);
+        points.emplace_back(r * std::cos(golden * i), y, r * std::sin(golden * i));
+    }
+    const VHACD::Vertex spikes[] = {VHACD::Vertex(3.3, -0.4, -0.9), VHACD::Vertex(-2.7, -3.5, -0.2), VHACD::Vertex(3.25, -1.1, -1.6)};
+    points.insert(points.end(), std::begin(spikes), std::end(spikes));
+
+    const auto keepsSpikes = [&](const VHACD::QuickHull& hull) {
+        for (const VHACD::Vertex& spike : spikes)
+        {
+            bool kept = false;
+            for (const VHACD::Vertex& p : hull.GetVertices())
+            {
+                kept = kept || (p.mX == spike.mX && p.mY == spike.mY && p.mZ == spike.mZ);
+            }
+            if (!kept)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Every spike is a vertex of the full hull, so a hull that drops one misses part of the shape.
+    VHACD::QuickHull full;
+    CHECK(full.ComputeConvexHull(points, uint32_t(points.size())) > 0);
+    CHECK(keepsSpikes(full));
+
+    // Taking the oldest face first spends this budget on sphere points and drops a spike.
+    VHACD::QuickHull limited;
+    CHECK(limited.ComputeConvexHull(points, 8) > 0);
+    CHECK(limited.GetVertices().size() <= 8);
+    CHECK(keepsSpikes(limited));
+}
+
 } // namespace
 
 int main()
@@ -319,6 +363,7 @@ int main()
     ReusedInstanceReproducesResults(*v);
     CenterIsTheSolidCentroid(*v);
     RotatedCubeRemainsOneHull(*v);
+    LimitedHullKeepsFarthestPoints();
     v->Release();
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures, g_failures == 1 ? "" : "s");

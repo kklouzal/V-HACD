@@ -359,7 +359,7 @@ public:
         uint32_t            m_maxRecursionDepth{ 10 };      // Pieces at this split depth are not split again (the root is depth 0), so at most 2^depth pieces precede merging
         bool                m_shrinkWrap{true};             // Whether or not to shrinkwrap the voxel positions to the source mesh on output
         FillMode            m_fillMode{ FillMode::FLOOD_FILL }; // How to fill the interior of the voxelized mesh
-        uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull; at least 4
+        uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull; at least 4. A hull over the limit keeps the vertices farthest out first
         uint32_t            m_minEdgeLength{ 2 };           // A piece whose voxel extent is at most this on all 3 axes is not split again
     };
 
@@ -2372,6 +2372,22 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 
     m_points.resize(count);
 
+    /*
+     * A hull of every point does not depend on the order faces are taken in, so those take the oldest face.
+     * A hull limited to maxVertexCount vertices keeps only the points added before the limit, so it takes the
+     * face whose farthest remaining point is farthest: each added vertex then restores the largest missing
+     * piece of the full hull, and a hull at the limit misses less of it.
+     */
+    const bool limitedVertexCount = maxVertexCount < count;
+    // Farthest remaining point distance per face index, DBL_MAX until evaluated and -DBL_MAX for a face without a
+    // valid plane. Points only leave the remaining set, so a stored distance never understates the current one.
+    std::vector<double> farthestDistance;
+    const auto measureFarthest = [&](const std::size_t face) {
+        bool valid;
+        const HullPlane plane(m_faces[face].GetPlaneEquation(m_points, valid));
+        return valid ? plane.Evalue(points[SupportVertex(&vertexTree, points, plane)]) : -DBL_MAX;
+    };
+
     count -= 4;
     maxVertexCount -= 4;
     int currentIndex = 4;
@@ -2386,28 +2402,53 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 
     while (boundaryCount && count && (maxVertexCount > 0))
     {
-        // my definition of the optimal convex hull of a given vertex count,
-        // is the convex hull formed by a subset of the input vertex that minimizes the volume difference
-        // between the perfect hull formed from all input vertex and the hull of the sub set of vertex.
-        // When using a priority heap this algorithms will generate the an optimal of a fix vertex count.
-        // Since all Newton's tools do not have a limit on the point count of a convex hull, I can use either a stack or a queue.
-        // a stack maximize construction speed, a Queue tend to maximize the volume of the generated Hull approaching a perfect Hull.
-        // For now we use a queue.
-        // For general hulls it does not make a difference if we use a stack, queue, or a priority heap.
-        // perfect optimal hull only apply for when build hull of a limited vertex count.
-        //
-        // Also when building Hulls of a limited vertex count, this function runs in constant time.
-        // yes that is correct, it does not makes a difference if you build a N point hull from 100 vertex
-        // or from 100000 vertex input array.
-
-        // using a queue (some what slower by better hull when reduced vertex count is desired)
         // Every face still waiting sits at or after boundaryHead.
         while (!m_faces[boundaryFaces[boundaryHead]].m_onBoundary)
         {
             boundaryHead++;
             assert(boundaryHead < boundaryFaces.size());
         }
-        const std::size_t faceNode = boundaryFaces[boundaryHead];
+        std::size_t faceNode = boundaryFaces[boundaryHead];
+        if (limitedVertexCount)
+        {
+            farthestDistance.resize(m_faces.size(), DBL_MAX);
+            for (;;)
+            {
+                // Ties go to the oldest face.
+                std::size_t leader = SIZE_MAX;
+                for (std::size_t entry = boundaryHead; entry < boundaryFaces.size(); ++entry)
+                {
+                    const std::size_t face = boundaryFaces[entry];
+                    if (!m_faces[face].m_onBoundary)
+                    {
+                        continue;
+                    }
+                    if (farthestDistance[face] == DBL_MAX)
+                    {
+                        farthestDistance[face] = measureFarthest(face);
+                    }
+                    if (leader == SIZE_MAX || farthestDistance[face] > farthestDistance[leader])
+                    {
+                        leader = face;
+                    }
+                }
+                assert(leader != SIZE_MAX);
+                // The leader's distance may be stale; it keeps the lead only if the current one still leads.
+                const double current = measureFarthest(leader);
+                if (current < farthestDistance[leader])
+                {
+                    farthestDistance[leader] = current;
+                    continue;
+                }
+                faceNode = leader;
+                break;
+            }
+            if (farthestDistance[faceNode] < distTol)
+            {
+                // No waiting face has a point far enough outside it.
+                break;
+            }
+        }
 
         bool isvalid;
         HullPlane planeEquation(m_faces[faceNode].GetPlaneEquation(m_points, isvalid));
