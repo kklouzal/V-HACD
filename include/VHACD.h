@@ -1907,14 +1907,38 @@ public:
     std::array<size_t, VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE> m_indices;
 };
 
+/*
+ * Storage for building convex hulls, kept by the caller so repeated builds reuse the vectors' capacity instead of
+ * allocating them again. A workspace serves one build at a time on one thread, and the vertex pool and faces of a
+ * hull built on it stay valid only until the next build on the same workspace.
+ */
+class ConvexHullWorkspace
+{
+    friend class ConvexHull;
+
+    std::vector<ConvexHullVertex> m_inputPoints;
+    std::vector<ConvexHullAABBTreeNode> m_tree;
+    std::vector<ConvexHullFace> m_faces;
+    std::vector<VHACD::Vect3> m_vertices;
+    std::vector<std::size_t> m_boundaryFaces;
+    std::vector<std::size_t> m_stack;
+    std::vector<std::size_t> m_coneList;
+    std::vector<std::size_t> m_deleteList;
+    std::vector<double> m_farthestDistance;
+};
+
 class ConvexHull
 {
     class ndNormalMap;
 
 public:
-    ConvexHull(const std::vector<::VHACD::Vertex>& vertexCloud,
+    // Builds the hull in workspace; its vertex pool and faces live there until the workspace's next build.
+    ConvexHull(ConvexHullWorkspace& workspace,
+               const std::vector<::VHACD::Vertex>& vertexCloud,
                double distTol,
                int maxVertexCount = 0x7fffffff);
+    ConvexHull(const ConvexHull&) = delete;
+    ConvexHull& operator=(const ConvexHull&) = delete;
     ~ConvexHull() = default;
 
     const std::vector<VHACD::Vect3>& GetVertexPool() const;
@@ -1959,9 +1983,10 @@ private:
                              const VHACD::Vect3& p2,
                              const VHACD::Vect3& p3) const;
 
-    std::vector<ConvexHullFace> m_faces;
+    ConvexHullWorkspace& m_workspace;
+    std::vector<ConvexHullFace>& m_faces;
     double m_diag{ 0.0 };
-    std::vector<VHACD::Vect3> m_points;
+    std::vector<VHACD::Vect3>& m_points;
 };
 
 class ConvexHull::ndNormalMap
@@ -2053,10 +2078,16 @@ ConvexHull::ndNormalMap::ndNormalMap()
     TessellateTriangle(subdivisions, p4, p1, p3, count);
 }
 
-ConvexHull::ConvexHull(const std::vector<::VHACD::Vertex>& vertexCloud,
+ConvexHull::ConvexHull(ConvexHullWorkspace& workspace,
+                       const std::vector<::VHACD::Vertex>& vertexCloud,
                        double distTol,
                        int maxVertexCount)
+    : m_workspace(workspace)
+    , m_faces(workspace.m_faces)
+    , m_points(workspace.m_vertices)
 {
+    m_faces.clear();
+    m_points.clear();
     if (vertexCloud.size() >= 4)
     {
         BuildHull(vertexCloud,
@@ -2074,7 +2105,8 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
                            double distTol,
                            int maxVertexCount)
 {
-    std::vector<ConvexHullVertex> points(vertexCloud.size());
+    std::vector<ConvexHullVertex>& points = m_workspace.m_inputPoints;
+    points.resize(vertexCloud.size());
     /*
      * treePool holds the AABB tree's nodes, root first
      * Leaf nodes hold up to 8 vertices and have null m_left and m_right, which is how SupportVertex tells them apart
@@ -2082,10 +2114,12 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
      *
      * Nodes point at each other, so BuildTreeOld reserves every node the tree can need before building it
      */
-    std::vector<ConvexHullAABBTreeNode> treePool;
+    std::vector<ConvexHullAABBTreeNode>& treePool = m_workspace.m_tree;
+    treePool.clear();
     for (size_t i = 0; i < vertexCloud.size(); ++i)
     {
         points[i] = VHACD::Vect3(vertexCloud[i]);
+        points[i].m_mark = 0;
     }
     int count = InitVertexArray(points,
                                 treePool);
@@ -2617,7 +2651,7 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
      * initial four go in reverse. A face leaves when it is tested and kept, or deleted; its entry stays behind
      * for boundaryHead to skip.
      */
-    std::vector<std::size_t> boundaryFaces;
+    std::vector<std::size_t>& boundaryFaces = m_workspace.m_boundaryFaces;
     boundaryFaces.reserve(expectedFaces);
     boundaryFaces.assign({ f3, f2, f1, f0 });
     std::size_t boundaryHead = 0;
@@ -2634,7 +2668,8 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
     const bool limitedVertexCount = maxVertexCount < count;
     // Farthest remaining point distance per face index, DBL_MAX until evaluated and -DBL_MAX for a face without a
     // valid plane. Points only leave the remaining set, so a stored distance never understates the current one.
-    std::vector<double> farthestDistance;
+    std::vector<double>& farthestDistance = m_workspace.m_farthestDistance;
+    farthestDistance.clear();
     const auto measureFarthest = [&](const std::size_t face) {
         bool valid;
         const HullPlane plane(m_faces[face].GetPlaneEquation(m_points, valid));
@@ -2645,13 +2680,10 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
     maxVertexCount -= 4;
     int currentIndex = 4;
 
-    std::vector<std::size_t> stack;
-    std::vector<std::size_t> coneList;
-    std::vector<std::size_t> deleteList;
-
-    stack.reserve(1024 + count);
-    coneList.reserve(1024 + count);
-    deleteList.reserve(1024 + count);
+    std::vector<std::size_t>& stack = m_workspace.m_stack;
+    std::vector<std::size_t>& coneList = m_workspace.m_coneList;
+    std::vector<std::size_t>& deleteList = m_workspace.m_deleteList;
+    stack.clear();
 
     while (boundaryCount && count && (maxVertexCount > 0))
     {
@@ -4403,7 +4435,8 @@ void Volume::FillInsideSurface(VHACDCallbacks& callbacks)
 class QuickHull
 {
 public:
-    uint32_t ComputeConvexHull(const std::vector<VHACD::Vertex>& vertices,
+    uint32_t ComputeConvexHull(ConvexHullWorkspace& workspace,
+                               const std::vector<VHACD::Vertex>& vertices,
                                uint32_t maxHullVertices);
 
     const std::vector<VHACD::Vertex>& GetVertices() const;
@@ -4414,12 +4447,14 @@ private:
     std::vector<VHACD::Triangle> m_indices;
 };
 
-uint32_t QuickHull::ComputeConvexHull(const std::vector<VHACD::Vertex>& vertices,
+uint32_t QuickHull::ComputeConvexHull(ConvexHullWorkspace& workspace,
+                                      const std::vector<VHACD::Vertex>& vertices,
                                       uint32_t maxHullVertices)
 {
     m_indices.clear();
 
-    VHACD::ConvexHull ch(vertices,
+    VHACD::ConvexHull ch(workspace,
+                         vertices,
                          double(0.0001),
                          maxHullVertices);
 
@@ -4458,7 +4493,8 @@ const std::vector<VHACD::Triangle>& QuickHull::GetIndices() const
 // Implementation of the ShrinkWrap function
 //******************************************************************************************
 
-void ShrinkWrap(SimpleMesh& sourceConvexHull,
+void ShrinkWrap(ConvexHullWorkspace& workspace,
+                SimpleMesh& sourceConvexHull,
                 const AABBTree& aabbTree,
                 uint32_t maxHullVertexCount,
                 double distanceThreshold,
@@ -4483,8 +4519,9 @@ void ShrinkWrap(SimpleMesh& sourceConvexHull,
     }
     // Final step is to recompute the convex hull
     VHACD::QuickHull qh;
-    uint32_t tcount = qh.ComputeConvexHull(verts,
-                                            maxHullVertexCount);
+    uint32_t tcount = qh.ComputeConvexHull(workspace,
+                                           verts,
+                                           maxHullVertexCount);
     if (tcount)
     {
         sourceConvexHull.m_vertices = qh.GetVertices();
@@ -4515,8 +4552,9 @@ public:
               uint32_t splitLoc);
 
     // Here we construct the initial convex hull around the
-    // entire voxel set
+    // entire voxel set. Its pieces build their hulls in hullWorkspace, which must outlive them.
     VoxelHull(Volume& voxels,
+              ConvexHullWorkspace& hullWorkspace,
               const IVHACD::Parameters &params);
 
     ~VoxelHull() = default;
@@ -4552,6 +4590,7 @@ public:
 
     SplitAxis               m_axis{ SplitAxis::X_AXIS_NEGATIVE };
     Volume*                 m_voxels{ nullptr }; // The voxelized data set
+    ConvexHullWorkspace*    m_hullWorkspace{ nullptr }; // Where this piece builds its hull
     double                  m_voxelScale{ 0 };   // Size of a single voxel
     double                  m_voxelScaleHalf{ 0 }; // 1/2 of the size of a single voxel
     VHACD::BoundsAABB       m_voxelBounds;
@@ -4583,6 +4622,7 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
                      uint32_t splitLoc)
     : m_axis(axis)
     , m_voxels(parent.m_voxels)
+    , m_hullWorkspace(parent.m_hullWorkspace)
     , m_voxelScale(m_voxels->GetScale())
     , m_voxelScaleHalf(m_voxelScale * double(0.5))
     , m_voxelBounds(m_voxels->GetBounds())
@@ -4715,8 +4755,10 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
 }
 
 VoxelHull::VoxelHull(Volume& voxels,
+                     ConvexHullWorkspace& hullWorkspace,
                      const IVHACD::Parameters& params)
     : m_voxels(&voxels)
+    , m_hullWorkspace(&hullWorkspace)
     , m_voxelScale(m_voxels->GetScale())
     , m_voxelScaleHalf(m_voxelScale * double(0.5))
     , m_voxelBounds(m_voxels->GetBounds())
@@ -4745,7 +4787,8 @@ void VoxelHull::ComputeConvexHull()
     {
         // we compute the convex hull as follows...
         VHACD::QuickHull qh;
-        uint32_t tcount = qh.ComputeConvexHull(m_vertices,
+        uint32_t tcount = qh.ComputeConvexHull(*m_hullWorkspace,
+                                               m_vertices,
                                                uint32_t(m_vertices.size()));
         if ( tcount )
         {
@@ -5147,6 +5190,8 @@ public:
 
     VHACD::AABBTree                                     m_AABBTree;
     VHACD::Volume                                       m_voxelize;
+    // Every hull build of a Compute runs in this workspace, one at a time.
+    ConvexHullWorkspace                                 m_hullWorkspace;
     VHACD::Vect3                                        m_center;
     double                                              m_scale{ double(1.0) };
     double                                              m_recipScale{ double(1.0) };
@@ -5302,6 +5347,8 @@ void VHACDImpl::Clean()
     m_convexHulls.clear();
     m_hulls.clear();
     m_sortedHullPoints.clear();
+    // The workspace keeps the capacity of the largest build; release it with the results.
+    m_hullWorkspace = ConvexHullWorkspace();
     m_liveHullCount = 0;
     // Pairs refer to hull ids, which a later Compute reuses.
     m_hullPairQueue = std::priority_queue<HullPair>();
@@ -5497,6 +5544,7 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                         0,
                         "Build initial ConvexHull");
         std::unique_ptr<VoxelHull> vh = std::unique_ptr<VoxelHull>(new VoxelHull(m_voxelize,
+                                                                                 m_hullWorkspace,
                                                                                  m_params));
         if ( vh->m_convexHull )
         {
@@ -5895,7 +5943,8 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeReducedConvexHull(const Co
     sourceConvexHull.m_vertices = ch.m_points;
     sourceConvexHull.m_indices = ch.m_triangles;
 
-    ShrinkWrap(sourceConvexHull,
+    ShrinkWrap(m_hullWorkspace,
+               sourceConvexHull,
                m_AABBTree,
                maxVerts,
                m_voxelScale,
@@ -5937,7 +5986,8 @@ double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
 {
     const std::vector<VHACD::Vertex> vertices = MergeHullPoints(sm1,
                                                                 sm2);
-    const VHACD::ConvexHull hull(vertices,
+    const VHACD::ConvexHull hull(m_hullWorkspace,
+                                 vertices,
                                  double(0.0001),
                                  int(vertices.size()));
 
@@ -5969,7 +6019,8 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeCombinedConvexHull(const C
     uint32_t vcount = uint32_t(vertices.size()); // Total vertices from both hulls
 
     VHACD::QuickHull qh;
-    qh.ComputeConvexHull(vertices,
+    qh.ComputeConvexHull(m_hullWorkspace,
+                         vertices,
                          vcount);
 
     std::unique_ptr<ConvexHull> ret(new ConvexHull);

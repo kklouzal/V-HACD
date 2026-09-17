@@ -340,13 +340,14 @@ void LimitedHullKeepsFarthestPoints()
     };
 
     // Every spike is a vertex of the full hull, so a hull that drops one misses part of the shape.
+    VHACD::ConvexHullWorkspace workspace;
     VHACD::QuickHull full;
-    CHECK(full.ComputeConvexHull(points, uint32_t(points.size())) > 0);
+    CHECK(full.ComputeConvexHull(workspace, points, uint32_t(points.size())) > 0);
     CHECK(keepsSpikes(full));
 
     // Taking the oldest face first spends this budget on sphere points and drops a spike.
     VHACD::QuickHull limited;
-    CHECK(limited.ComputeConvexHull(points, 8) > 0);
+    CHECK(limited.ComputeConvexHull(workspace, points, 8) > 0);
     CHECK(limited.GetVertices().size() <= 8);
     CHECK(keepsSpikes(limited));
 }
