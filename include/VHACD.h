@@ -801,7 +801,6 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <list>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -1061,70 +1060,6 @@ double ComputeMeshVolume(const std::vector<VHACD::Vertex>& vertices,
     return volume;
 }
 
-/*
- * To minimize memory allocations while maintaining pointer stability.
- * Used by the ConvexHull AABB tree, whose nodes refer to each other by pointer.
- * It does not support random access or iteration: elements are placed in the pool and referenced by pointer.
- * All elements are default constructed in NodeStorage's m_nodes array
- */
-template <typename T, std::size_t MaxBundleSize = 1024>
-class NodeBundle
-{
-    struct NodeStorage {
-        bool IsFull() const;
-
-        T& GetNextNode();
-
-        std::size_t m_index;
-        std::array<T, MaxBundleSize> m_nodes;
-    };
-
-    std::list<NodeStorage> m_list;
-    typename std::list<NodeStorage>::iterator m_head{ m_list.end() };
-
-public:
-    T& GetNextNode();
-
-    T& GetFirstNode();
-
-};
-
-template <typename T, std::size_t MaxBundleSize>
-bool NodeBundle<T, MaxBundleSize>::NodeStorage::IsFull() const
-{
-    return m_index == MaxBundleSize;
-}
-
-template <typename T, std::size_t MaxBundleSize>
-T& NodeBundle<T, MaxBundleSize>::NodeStorage::GetNextNode()
-{
-    assert(m_index < MaxBundleSize);
-    T& ret = m_nodes[m_index];
-    m_index++;
-    return ret;
-}
-
-template <typename T, std::size_t MaxBundleSize>
-T& NodeBundle<T, MaxBundleSize>::GetNextNode()
-{
-    /*
-     * || short circuits, so doesn't dereference if m_bundle == m_bundleHead.end()
-     */
-    if (   m_head == m_list.end()
-        || m_head->IsFull())
-    {
-        m_head = m_list.emplace(m_list.end());
-    }
-
-    return m_head->GetNextNode();
-}
-
-template <typename T, std::size_t MaxBundleSize>
-T& NodeBundle<T, MaxBundleSize>::GetFirstNode()
-{
-    assert(m_head != m_list.end());
-    return m_list.front().m_nodes[0];
-}
 
 /*
  * Returns index of highest set bit in x
@@ -1633,8 +1568,10 @@ public:
 
     std::array<int, 3> m_index;
 private:
-    int m_mark{ 0 };
-    std::array<std::list<ConvexHullFace>::iterator, 3> m_twin;
+    int m_mark{ 0 };           // Set when a new vertex sees the face, which is then deleted
+    bool m_onBoundary{ true }; // Not yet tested against the remaining points
+    // m_twin[i] indexes the face across the edge from m_index[i] to m_index[(i + 1) % 3], during construction only.
+    std::array<std::size_t, 3> m_twin{ { SIZE_MAX, SIZE_MAX, SIZE_MAX } };
 
     friend class ConvexHull;
 };
@@ -1741,7 +1678,8 @@ public:
 
     const std::vector<VHACD::Vect3>& GetVertexPool() const;
 
-    const std::list<ConvexHullFace>& GetList() const { return m_list; }
+    // The hull's faces, in creation order.
+    const std::vector<ConvexHullFace>& GetFaces() const { return m_faces; }
 
 private:
     void BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
@@ -1750,20 +1688,20 @@ private:
 
     void GetUniquePoints(std::vector<ConvexHullVertex>& points);
     int InitVertexArray(std::vector<ConvexHullVertex>& points,
-                        NodeBundle<ConvexHullAABBTreeNode>& memoryPool);
+                        std::vector<ConvexHullAABBTreeNode>& memoryPool);
 
     ConvexHullAABBTreeNode* BuildTreeOld(std::vector<ConvexHullVertex>& points,
-                                         NodeBundle<ConvexHullAABBTreeNode>& memoryPool);
+                                         std::vector<ConvexHullAABBTreeNode>& memoryPool);
     ConvexHullAABBTreeNode* BuildTreeRecurse(ConvexHullAABBTreeNode* const parent,
                                              ConvexHullVertex* const points,
                                              int count,
                                              int baseIndex,
                                              int depth,
-                                             NodeBundle<ConvexHullAABBTreeNode>& memoryPool) const;
+                                             std::vector<ConvexHullAABBTreeNode>& memoryPool) const;
 
-    std::list<ConvexHullFace>::iterator AddFace(int i0,
-                                                int i1,
-                                                int i2);
+    std::size_t AddFace(int i0,
+                        int i1,
+                        int i2);
 
     void CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                                std::vector<ConvexHullVertex>& points,
@@ -1780,7 +1718,7 @@ private:
                              const VHACD::Vect3& p2,
                              const VHACD::Vect3& p3) const;
 
-    std::list<ConvexHullFace> m_list;
+    std::vector<ConvexHullFace> m_faces;
     double m_diag{ 0.0 };
     std::vector<VHACD::Vect3> m_points;
 };
@@ -1897,18 +1835,13 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
 {
     std::vector<ConvexHullVertex> points(vertexCloud.size());
     /*
-     * treePool provides a memory pool for the AABB tree
-     * Each node is either a leaf or non-leaf node
-     * Non-leaf nodes have up to 8 vertices
+     * treePool holds the AABB tree's nodes, root first
+     * Leaf nodes hold up to 8 vertices and have null m_left and m_right, which is how SupportVertex tells them apart
      * Vertices are specified by the m_indices array and are accessed via the points array
      *
-     * Later on in ConvexHull::SupportVertex, the tree is used directly
-     * It differentiates between ConvexHullAABBTreeNode and ConvexHull3DPointCluster by whether the m_left and m_right
-     * pointers are null or not
-     *
-     * Pointers have to be stable
+     * Nodes point at each other, so BuildTreeOld reserves every node the tree can need before building it
      */
-    NodeBundle<ConvexHullAABBTreeNode> treePool;
+    std::vector<ConvexHullAABBTreeNode> treePool;
     for (size_t i = 0; i < vertexCloud.size(); ++i)
     {
         points[i] = VHACD::Vect3(vertexCloud[i]);
@@ -1918,7 +1851,7 @@ void ConvexHull::BuildHull(const std::vector<::VHACD::Vertex>& vertexCloud,
 
     if (m_points.size() >= 4)
     {
-        CalculateConvexHull3D(&treePool.GetFirstNode(),
+        CalculateConvexHull3D(&treePool.front(),
                               points,
                               count,
                               distTol,
@@ -1951,7 +1884,7 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
                                                      int count,
                                                      int baseIndex,
                                                      int depth,
-                                                     NodeBundle<ConvexHullAABBTreeNode>& memoryPool) const
+                                                     std::vector<ConvexHullAABBTreeNode>& memoryPool) const
 {
     ConvexHullAABBTreeNode* tree = nullptr;
 
@@ -1960,7 +1893,8 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
     VHACD::Vect3 maxP(-double(1.0e15));
     if (count <= VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE)
     {
-        ConvexHullAABBTreeNode& clump = memoryPool.GetNextNode();
+        assert(memoryPool.size() < memoryPool.capacity());
+        ConvexHullAABBTreeNode& clump = memoryPool.emplace_back();
 
         clump.m_count = count;
         for (int i = 0; i < count; ++i)
@@ -2047,7 +1981,8 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
             i0 = count / 2;
         }
 
-        tree = &memoryPool.GetNextNode();
+        assert(memoryPool.size() < memoryPool.capacity());
+        tree = &memoryPool.emplace_back();
 
         assert(i0);
         assert(count - i0);
@@ -2078,7 +2013,7 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
 }
 
 ConvexHullAABBTreeNode* ConvexHull::BuildTreeOld(std::vector<ConvexHullVertex>& points,
-                                                 NodeBundle<ConvexHullAABBTreeNode>& memoryPool)
+                                                 std::vector<ConvexHullAABBTreeNode>& memoryPool)
 {
     GetUniquePoints(points);
     int count = int(points.size());
@@ -2086,6 +2021,9 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeOld(std::vector<ConvexHullVertex>& 
     {
         return nullptr;
     }
+    // Both sides of every split are non-empty, so the tree has at most count leaves and one inner node fewer.
+    // Nodes never move once that many are reserved.
+    memoryPool.reserve(2 * std::size_t(count) - 1);
     return BuildTreeRecurse(nullptr,
                             points.data(),
                             count,
@@ -2243,7 +2181,7 @@ double ConvexHull::TetrahedrumVolume(const VHACD::Vect3& p0,
 }
 
 int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
-                                NodeBundle<ConvexHullAABBTreeNode>& memoryPool)
+                                std::vector<ConvexHullAABBTreeNode>& memoryPool)
 {
     ConvexHullAABBTreeNode* tree = BuildTreeOld(points,
                                                 memoryPool);
@@ -2395,17 +2333,15 @@ int ConvexHull::InitVertexArray(std::vector<ConvexHullVertex>& points,
     return count;
 }
 
-std::list<ConvexHullFace>::iterator ConvexHull::AddFace(int i0,
-                                                        int i1,
-                                                        int i2)
+std::size_t ConvexHull::AddFace(int i0,
+                                int i1,
+                                int i2)
 {
-    ConvexHullFace face;
+    ConvexHullFace& face = m_faces.emplace_back();
     face.m_index[0] = i0;
     face.m_index[1] = i1;
     face.m_index[2] = i2;
-
-    std::list<ConvexHullFace>::iterator node = m_list.emplace(m_list.end(), face);
-    return node;
+    return m_faces.size() - 1;
 }
 
 void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
@@ -2415,37 +2351,24 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                                        int maxVertexCount)
 {
     distTol = fabs(distTol) * m_diag;
-    std::list<ConvexHullFace>::iterator f0Node = AddFace(0, 1, 2);
-    std::list<ConvexHullFace>::iterator f1Node = AddFace(0, 2, 3);
-    std::list<ConvexHullFace>::iterator f2Node = AddFace(2, 1, 3);
-    std::list<ConvexHullFace>::iterator f3Node = AddFace(1, 0, 3);
+    const std::size_t f0 = AddFace(0, 1, 2);
+    const std::size_t f1 = AddFace(0, 2, 3);
+    const std::size_t f2 = AddFace(2, 1, 3);
+    const std::size_t f3 = AddFace(1, 0, 3);
 
-    ConvexHullFace& f0 = *f0Node;
-    ConvexHullFace& f1 = *f1Node;
-    ConvexHullFace& f2 = *f2Node;
-    ConvexHullFace& f3 = *f3Node;
+    m_faces[f0].m_twin = { f3, f2, f1 };
+    m_faces[f1].m_twin = { f0, f2, f3 };
+    m_faces[f2].m_twin = { f0, f3, f1 };
+    m_faces[f3].m_twin = { f0, f1, f2 };
 
-    f0.m_twin[0] = f3Node;
-    f0.m_twin[1] = f2Node;
-    f0.m_twin[2] = f1Node;
-
-    f1.m_twin[0] = f0Node;
-    f1.m_twin[1] = f2Node;
-    f1.m_twin[2] = f3Node;
-
-    f2.m_twin[0] = f0Node;
-    f2.m_twin[1] = f3Node;
-    f2.m_twin[2] = f1Node;
-
-    f3.m_twin[0] = f0Node;
-    f3.m_twin[1] = f1Node;
-    f3.m_twin[2] = f2Node;
-
-    std::list<std::list<ConvexHullFace>::iterator> boundaryFaces;
-    boundaryFaces.push_back(f0Node);
-    boundaryFaces.push_back(f1Node);
-    boundaryFaces.push_back(f2Node);
-    boundaryFaces.push_back(f3Node);
+    /*
+     * Faces wait here to be tested against the remaining points and are taken oldest first, except that the
+     * initial four go in reverse. A face leaves when it is tested and kept, or deleted; its entry stays behind
+     * for boundaryHead to skip.
+     */
+    std::vector<std::size_t> boundaryFaces{ f3, f2, f1, f0 };
+    std::size_t boundaryHead = 0;
+    std::size_t boundaryCount = boundaryFaces.size();
 
     m_points.resize(count);
 
@@ -2453,18 +2376,15 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
     maxVertexCount -= 4;
     int currentIndex = 4;
 
-    /*
-     * Some are iterators into boundaryFaces, others into m_list
-     */
-    std::vector<std::list<ConvexHullFace>::iterator> stack;
-    std::vector<std::list<ConvexHullFace>::iterator> coneList;
-    std::vector<std::list<ConvexHullFace>::iterator> deleteList;
+    std::vector<std::size_t> stack;
+    std::vector<std::size_t> coneList;
+    std::vector<std::size_t> deleteList;
 
     stack.reserve(1024 + count);
     coneList.reserve(1024 + count);
     deleteList.reserve(1024 + count);
 
-    while (boundaryFaces.size() && count && (maxVertexCount > 0))
+    while (boundaryCount && count && (maxVertexCount > 0))
     {
         // my definition of the optimal convex hull of a given vertex count,
         // is the convex hull formed by a subset of the input vertex that minimizes the volume difference
@@ -2481,10 +2401,16 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
         // or from 100000 vertex input array.
 
         // using a queue (some what slower by better hull when reduced vertex count is desired)
+        // Every face still waiting sits at or after boundaryHead.
+        while (!m_faces[boundaryFaces[boundaryHead]].m_onBoundary)
+        {
+            boundaryHead++;
+            assert(boundaryHead < boundaryFaces.size());
+        }
+        const std::size_t faceNode = boundaryFaces[boundaryHead];
+
         bool isvalid;
-        std::list<ConvexHullFace>::iterator faceNode = boundaryFaces.back();
-        ConvexHullFace& face = *faceNode;
-        HullPlane planeEquation(face.GetPlaneEquation(m_points, isvalid));
+        HullPlane planeEquation(m_faces[faceNode].GetPlaneEquation(m_points, isvalid));
 
         int index = 0;
         double dist = 0;
@@ -2500,22 +2426,22 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 
         if (   isvalid
             && (dist >= distTol)
-            && (face.Evalue(m_points, p) < double(0.0)))
+            && (m_faces[faceNode].Evalue(m_points, p) < double(0.0)))
         {
             stack.push_back(faceNode);
 
             deleteList.clear();
             while (stack.size())
             {
-                std::list<ConvexHullFace>::iterator node1 = stack.back();
-                ConvexHullFace& face1 = *node1;
+                const std::size_t node1 = stack.back();
+                ConvexHullFace& face1 = m_faces[node1];
 
                 stack.pop_back();
 
                 if (!face1.m_mark && (face1.Evalue(m_points, p) < double(0.0)))
                 {
                     #ifdef _DEBUG
-                    for (const auto node : deleteList)
+                    for (const std::size_t node : deleteList)
                     {
                         assert(node != node1);
                     }
@@ -2523,10 +2449,10 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 
                     deleteList.push_back(node1);
                     face1.m_mark = 1;
-                    for (std::list<ConvexHullFace>::iterator& twinNode : face1.m_twin)
+                    for (const std::size_t twinNode : face1.m_twin)
                     {
-                        ConvexHullFace& twinFace = *twinNode;
-                        if (!twinFace.m_mark)
+                        assert(twinNode < m_faces.size());
+                        if (!m_faces[twinNode].m_mark)
                         {
                             stack.push_back(twinNode);
                         }
@@ -2537,30 +2463,29 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
             m_points[currentIndex] = points[index];
             points[index].m_mark = 1;
 
+            // AddFace can reallocate m_faces, so no face reference is held across it.
             coneList.clear();
-            for (const std::list<ConvexHullFace>::iterator& node1 : deleteList)
+            for (const std::size_t node1 : deleteList)
             {
-                ConvexHullFace& face1 = *node1;
-                assert(face1.m_mark == 1);
-                for (std::size_t j0 = 0; j0 < face1.m_twin.size(); ++j0)
+                assert(m_faces[node1].m_mark == 1);
+                for (std::size_t j0 = 0; j0 < 3; ++j0)
                 {
-                    std::list<ConvexHullFace>::iterator twinNode = face1.m_twin[j0];
-                    ConvexHullFace& twinFace = *twinNode;
-                    if (!twinFace.m_mark)
+                    const std::size_t twinNode = m_faces[node1].m_twin[j0];
+                    if (!m_faces[twinNode].m_mark)
                     {
                         std::size_t j1 = (j0 == 2) ? 0 : j0 + 1;
-                        std::list<ConvexHullFace>::iterator newNode = AddFace(currentIndex,
-                                                                              face1.m_index[j0],
-                                                                              face1.m_index[j1]);
-                        boundaryFaces.push_front(newNode);
-                        ConvexHullFace& newFace = *newNode;
+                        const std::size_t newNode = AddFace(currentIndex,
+                                                            m_faces[node1].m_index[j0],
+                                                            m_faces[node1].m_index[j1]);
+                        boundaryFaces.push_back(newNode);
+                        boundaryCount++;
 
-                        newFace.m_twin[1] = twinNode;
-                        for (std::size_t k = 0; k < twinFace.m_twin.size(); ++k)
+                        m_faces[newNode].m_twin[1] = twinNode;
+                        for (std::size_t& twinOfTwin : m_faces[twinNode].m_twin)
                         {
-                            if (twinFace.m_twin[k] == node1)
+                            if (twinOfTwin == node1)
                             {
-                                twinFace.m_twin[k] = newNode;
+                                twinOfTwin = newNode;
                             }
                         }
                         coneList.push_back(newNode);
@@ -2572,13 +2497,13 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
             assert(!coneList.empty());
             for (std::size_t i = 0; i + 1 < coneList.size(); ++i)
             {
-                std::list<ConvexHullFace>::iterator nodeA = coneList[i];
-                ConvexHullFace& faceA = *nodeA;
+                const std::size_t nodeA = coneList[i];
+                ConvexHullFace& faceA = m_faces[nodeA];
                 assert(faceA.m_mark == 0);
                 for (std::size_t j = i + 1; j < coneList.size(); j++)
                 {
-                    std::list<ConvexHullFace>::iterator nodeB = coneList[j];
-                    ConvexHullFace& faceB = *nodeB;
+                    const std::size_t nodeB = coneList[j];
+                    ConvexHullFace& faceB = m_faces[nodeB];
                     assert(faceB.m_mark == 0);
                     if (faceA.m_index[2] == faceB.m_index[1])
                     {
@@ -2590,8 +2515,8 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 
                 for (std::size_t j = i + 1; j < coneList.size(); j++)
                 {
-                    std::list<ConvexHullFace>::iterator nodeB = coneList[j];
-                    ConvexHullFace& faceB = *nodeB;
+                    const std::size_t nodeB = coneList[j];
+                    ConvexHullFace& faceB = m_faces[nodeB];
                     assert(faceB.m_mark == 0);
                     if (faceA.m_index[1] == faceB.m_index[2])
                     {
@@ -2602,16 +2527,14 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                 }
             }
 
-            for (const std::list<ConvexHullFace>::iterator& node : deleteList)
+            for (const std::size_t node : deleteList)
             {
-                auto it = std::find(boundaryFaces.begin(),
-                                    boundaryFaces.end(),
-                                    node);
-                if (it != boundaryFaces.end())
+                ConvexHullFace& deleted = m_faces[node];
+                if (deleted.m_onBoundary)
                 {
-                    boundaryFaces.erase(it);
+                    deleted.m_onBoundary = false;
+                    boundaryCount--;
                 }
-                m_list.erase(node);
             }
 
             maxVertexCount--;
@@ -2620,16 +2543,17 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
         }
         else
         {
-            auto it = std::find(boundaryFaces.begin(),
-                                boundaryFaces.end(),
-                                faceNode);
-            if (it != boundaryFaces.end())
-            {
-                boundaryFaces.erase(it);
-            }
+            m_faces[faceNode].m_onBoundary = false;
+            boundaryCount--;
         }
     }
     m_points.resize(currentIndex);
+
+    // Deleted faces stay in m_faces, marked, until here. The survivors keep their creation order.
+    m_faces.erase(std::remove_if(m_faces.begin(),
+                                 m_faces.end(),
+                                 [](const ConvexHullFace& face) { return face.m_mark != 0; }),
+                  m_faces.end());
 }
 
 //***********************************************************************************************
@@ -4207,9 +4131,9 @@ uint32_t QuickHull::ComputeConvexHull(const std::vector<VHACD::Vertex>& vertices
                   m_vertices.begin());
     }
 
-    for (std::list<ConvexHullFace>::const_iterator node = ch.GetList().begin(); node != ch.GetList().end(); ++node)
+    m_indices.reserve(ch.GetFaces().size());
+    for (const VHACD::ConvexHullFace& face : ch.GetFaces())
     {
-        const VHACD::ConvexHullFace& face = *node;
         m_indices.emplace_back(face.m_index[0],
                                face.m_index[1],
                                face.m_index[2]);
