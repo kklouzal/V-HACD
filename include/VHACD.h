@@ -4001,16 +4001,16 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                 for (size_t k_id = k0; k_id < k1; ++k_id)
                 {
                     boxcenter[2] = uint32_t(k_id);
-                    bool res = TriBoxOverlap(boxcenter,
-                                             boxhalfsize,
-                                             p[0],
-                                             p[1],
-                                             p[2]);
+                    // A voxel an earlier triangle already marked keeps its surface flags, so it needs no overlap test.
                     VoxelValue& value = GetVoxel(i_id,
                                                  j_id,
                                                  k_id);
-                    if (   res
-                        && value == VoxelValue::PRIMITIVE_UNDEFINED)
+                    if (   value == VoxelValue::PRIMITIVE_UNDEFINED
+                        && TriBoxOverlap(boxcenter,
+                                         boxhalfsize,
+                                         p[0],
+                                         p[1],
+                                         p[2]))
                     {
                         value = VoxelValue::PRIMITIVE_ON_SURFACE;
                         m_surfaceVoxels.emplace_back(uint32_t(i_id),
