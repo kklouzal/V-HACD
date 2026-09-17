@@ -2149,16 +2149,27 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
     }
     else
     {
-        VHACD::Vect3 median(0);
-        VHACD::Vect3 varian(0);
+        // Per-axis scalars, summed in point order as the vector operations did.
+        double low[3] = { minP[0], minP[1], minP[2] };
+        double high[3] = { maxP[0], maxP[1], maxP[2] };
+        double sum[3] = { 0.0, 0.0, 0.0 };
+        double sumSquares[3] = { 0.0, 0.0, 0.0 };
         for (int i = 0; i < count; ++i)
         {
             const VHACD::Vect3& p = points[i];
-            minP = minP.CWiseMin(p);
-            maxP = maxP.CWiseMax(p);
-            median += p;
-            varian += p.CWiseMul(p);
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                const double value = p[axis];
+                low[axis] = std::min(low[axis], value);
+                high[axis] = std::max(high[axis], value);
+                sum[axis] += value;
+                sumSquares[axis] += value * value;
+            }
         }
+        minP = VHACD::Vect3(low[0], low[1], low[2]);
+        maxP = VHACD::Vect3(high[0], high[1], high[2]);
+        VHACD::Vect3 median(sum[0], sum[1], sum[2]);
+        VHACD::Vect3 varian(sumSquares[0], sumSquares[1], sumSquares[2]);
 
         varian = varian * double(count) - median.CWiseMul(median);
         int index = 0;
@@ -2588,6 +2599,9 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
                                        int maxVertexCount)
 {
     distTol = fabs(distTol) * m_diag;
+    // Builds create one to three faces per input point, so this holds almost all of them without reallocation.
+    const std::size_t expectedFaces = std::min<std::size_t>(4 * std::size_t(count), 1024);
+    m_faces.reserve(expectedFaces);
     const std::size_t f0 = AddFace(0, 1, 2);
     const std::size_t f1 = AddFace(0, 2, 3);
     const std::size_t f2 = AddFace(2, 1, 3);
@@ -2603,7 +2617,9 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
      * initial four go in reverse. A face leaves when it is tested and kept, or deleted; its entry stays behind
      * for boundaryHead to skip.
      */
-    std::vector<std::size_t> boundaryFaces{ f3, f2, f1, f0 };
+    std::vector<std::size_t> boundaryFaces;
+    boundaryFaces.reserve(expectedFaces);
+    boundaryFaces.assign({ f3, f2, f1, f0 });
     std::size_t boundaryHead = 0;
     std::size_t boundaryCount = boundaryFaces.size();
 
@@ -2706,9 +2722,18 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
             && (dist >= distTol)
             && (m_faces[faceNode].Evalue(m_points, p) < double(0.0)))
         {
-            stack.push_back(faceNode);
-
+            // faceNode sees p, as tested above, so the flood fill starts from its neighbors.
             deleteList.clear();
+            deleteList.push_back(faceNode);
+            m_faces[faceNode].m_mark = 1;
+            for (const std::size_t twinNode : m_faces[faceNode].m_twin)
+            {
+                assert(twinNode < m_faces.size());
+                if (!m_faces[twinNode].m_mark)
+                {
+                    stack.push_back(twinNode);
+                }
+            }
             while (stack.size())
             {
                 const std::size_t node1 = stack.back();
