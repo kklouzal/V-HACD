@@ -1664,6 +1664,18 @@ double ConvexHullFace::Evalue(const std::vector<VHACD::Vect3>& pointArray,
         return det;
     }
 
+    // A floating-point difference is zero only when its operands are equal, so a zero row or column here is
+    // also zero in the exact matrix below and the determinant is exactly zero. Points sharing an axis-aligned
+    // voxel face make up most of the evaluations that reach this point.
+    for (int i = 0; i < 3; ++i)
+    {
+        if (   (matrix[i][0] == double(0.0) && matrix[i][1] == double(0.0) && matrix[i][2] == double(0.0))
+            || (matrix[0][i] == double(0.0) && matrix[1][i] == double(0.0) && matrix[2][i] == double(0.0)))
+        {
+            return double(0.0);
+        }
+    }
+
     const VHACD::Vector3<Googol> p0g = pointArray[m_index[0]];
     const VHACD::Vector3<Googol> p1g = pointArray[m_index[1]];
     const VHACD::Vector3<Googol> p2g = pointArray[m_index[2]];
