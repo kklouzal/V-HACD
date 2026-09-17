@@ -148,10 +148,11 @@ int main(int argc,const char **argv)
 	{
 		printf("Usage: TestVHACD <wavefront.obj> (options)\n");
 		printf("\n");
-		printf("-h <n>                  : Maximum number of output convex hulls. Default is 32\n");
-		printf("-r <voxelresolution>    : Total number of voxels to use. Default is 100,000\n");
+		printf("-h <n>                  : Maximum number of output convex hulls. Default is 64\n");
+		printf("-r <voxelresolution>    : Voxel budget; the longest axis gets floor(1.5 * r^0.33) voxels. Default is 400,000\n");
 		printf("-e <volumeErrorPercent> : Volume error allowed as a percentage. Default is 1%%. Valid range is 0.001 to 10\n");
-		printf("-d <maxRecursionDepth>  : Maximum recursion depth. Default value is 10.\n");
+		printf("-t <tiltedAllowance>    : Voxel volumes per tilted-surface voxel not counted as volume error. Default is 0.5\n");
+		printf("-d <maxRecursionDepth>  : Pieces at this split depth are not split again. Default value is 10.\n");
 		printf("-s <true/false>         : Whether or not to shrinkwrap output to source mesh. Default is true.\n");
 		printf("-f <fillMode>           : Fill mode. Default is 'flood', also 'surface' and 'raycast' are valid.\n");
 		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 64\n");
@@ -219,6 +220,19 @@ int main(int argc,const char **argv)
 					{
 						p.m_minimumVolumePercentErrorAllowed = e;
 						printf("Minimum volume error allowed set to: %0.2f%%\n", p.m_minimumVolumePercentErrorAllowed);
+					}
+				}
+				else if ( strcmp(option,"-t") == 0 )
+				{
+					double t = atof(value);
+					if ( !std::isfinite(t) || t < 0 )
+					{
+						printf("Invalid tilted-surface allowance. It must be finite and at least 0, got %f\n", t);
+					}
+					else
+					{
+						p.m_tiltedSurfaceAllowance = t;
+						printf("Tilted-surface allowance set to: %0.2f\n", p.m_tiltedSurfaceAllowance);
 					}
 				}
 				else if ( strcmp(option,"-o") == 0 )

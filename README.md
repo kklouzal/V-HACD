@@ -1,3 +1,26 @@
+# This fork
+
+kklouzal/V-HACD is a maintained fork of the archived [kmammou/v-hacd](https://github.com/kmammou/v-hacd)
+4.1, still a single header. Compared with upstream:
+
+- `Compute` returns `IVHACD::ComputeResult` (`Completed`, `Canceled`, `InvalidInput`) and rejects
+  non-finite coordinates, out-of-range indices and parameters outside their documented ranges.
+- Decomposition runs on the calling thread only; `m_asyncACD` and the internal thread pool are gone.
+  Progress is reported often enough for `Cancel` from `IUserCallback::Update` to take effect promptly.
+- Output is deterministic: merge order and hull order no longer depend on hash-table iteration.
+- Input vertices are welded only when their positions are identical. Upstream welded within 0.1% of
+  the model size, which could delete small parts of large models entirely.
+- `m_tiltedSurfaceAllowance` (default 0.5) stops the voxel staircase on surfaces that are not
+  axis-aligned from counting as concavity, so convex shapes such as a rotated cube stay one hull.
+- `m_maxRecursionDepth` is exact: pieces at that depth are not split again (upstream split one level
+  deeper).
+- A hull reduced to `m_maxNumVerticesPerCH` keeps the vertices farthest out first.
+- About 7x faster than upstream on a 611-model game corpus, mostly by removing a voxel raycast mesh
+  that nothing read.
+- Latent undefined behavior is fixed, and `test/ContractTests.cpp` covers the API contract.
+
+The upstream README follows.
+
 > ⚠️ **DEPRECATED & ARCHIVED**
 > This project is no longer maintained. For a modern, convex decomposition tool with automatic error-threshold-based hull count, please see **[CoACD — Collision-Aware ACD](https://github.com/SarahWeiii/CoACD)**.
 
@@ -59,7 +82,7 @@ The design of this version is that you tell it how much detail, in the form of h
 
 If you want only 4 convex hulls, then specify that.
 
-The default value is 32 convex hulls, which is often way too high. Just adjust the number to match your design goal.
+The default value is 64 convex hulls, which is often way too high. Just adjust the number to match your design goal.
 
 Based on your use case, simply specify the number of hulls that makes sense to use.
 
@@ -71,7 +94,7 @@ If you want as accurate results as possible and don't care if it takes quite a b
 
 Finally you can set the maximum decomposition depth to much higher than the default value of 10. Setting it to say 15 (-d 15) will allow the algorithm to recurse much more deeply into the shape. A higher depth value requires a 64 bit build of the library.
 
-Example: TestVHACD beshon.obj -e 0.01 -d 15 -r 10000000 -r 128
+Example: TestVHACD beshon.obj -e 0.01 -d 15 -r 10000000 -h 128
 
 Usually this may be overkill for your use case but if you have say machined parts with sharp angles, these settings have a better chance of giving a good result.
 
