@@ -63,13 +63,16 @@ Mesh LShape()
     return a;
 }
 
+// The test meshes are a few units across, so these are the tolerances of a model of that size.
 IVHACD::Parameters DefaultParams()
 {
     IVHACD::Parameters p;
     p.m_maxConvexHulls = 8;
-    p.m_resolution = 20000;
     p.m_maxNumVerticesPerCH = 32;
-    p.m_maxRecursionDepth = 6;
+    p.m_relativeTolerance = 0.02;
+    p.m_minTolerance = 0.02;
+    p.m_maxTolerance = 0.1;
+    p.m_probeRadius = 0.05;
     return p;
 }
 
@@ -171,25 +174,33 @@ void InvalidParametersAreRejected(IVHACD& v)
     CHECK(Run(v, box, p) == Result::InvalidInput);
 
     p = DefaultParams();
-    p.m_minimumVolumePercentErrorAllowed = std::numeric_limits<double>::quiet_NaN();
+    p.m_relativeTolerance = std::numeric_limits<double>::quiet_NaN();
     CHECK(Run(v, box, p) == Result::InvalidInput);
-    p.m_minimumVolumePercentErrorAllowed = -1;
-    CHECK(Run(v, box, p) == Result::InvalidInput);
-
-    p = DefaultParams();
-    p.m_resolution = std::numeric_limits<uint32_t>::max();
+    p.m_relativeTolerance = 0;
     CHECK(Run(v, box, p) == Result::InvalidInput);
 
     p = DefaultParams();
-    p.m_tiltedSurfaceAllowance = std::numeric_limits<double>::infinity();
+    p.m_minTolerance = -1;
     CHECK(Run(v, box, p) == Result::InvalidInput);
-    p.m_tiltedSurfaceAllowance = -0.5;
+
+    p = DefaultParams();
+    p.m_maxTolerance = p.m_minTolerance / 2;
+    CHECK(Run(v, box, p) == Result::InvalidInput);
+
+    p = DefaultParams();
+    p.m_probeRadius = std::numeric_limits<double>::infinity();
+    CHECK(Run(v, box, p) == Result::InvalidInput);
+    p.m_probeRadius = -0.5;
+    CHECK(Run(v, box, p) == Result::InvalidInput);
+
+    p = DefaultParams();
+    p.m_maxVoxels = 8;
     CHECK(Run(v, box, p) == Result::InvalidInput);
 }
 
 // A unit cube rotated off every axis is convex, so it must remain one hull. Its voxelized faces are
-// staircases whose corner hull always exceeds the voxels; without the tilted-surface allowance that
-// gap reads as concavity and the cube splits down to the recursion limit.
+// staircases whose corner hull always exceeds the voxels, and the notches of that staircase stay within
+// the tolerance, so nothing about them makes the cube split.
 void RotatedCubeRemainsOneHull(IVHACD& v)
 {
     const double a = 0.5;
@@ -205,17 +216,163 @@ void RotatedCubeRemainsOneHull(IVHACD& v)
         cube.points[i + 1] = x * s * c + y * c * c - z * s;
         cube.points[i + 2] = x * s * s + y * c * s + z * c;
     }
-    IVHACD::Parameters p;
+    IVHACD::Parameters p = DefaultParams();
     p.m_maxConvexHulls = 32;
-    p.m_resolution = 100000;
     p.m_maxNumVerticesPerCH = 44;
-    p.m_maxRecursionDepth = 9;
     CHECK(Run(v, cube, p) == Result::Completed);
     CHECK(v.GetNConvexHulls() == 1);
+}
 
-    p.m_tiltedSurfaceAllowance = 0;
-    CHECK(Run(v, cube, p) == Result::Completed);
+// The tolerance is what decides the count: a concave model splits while a hull would stand too far off
+// it, and a tolerance larger than the model itself leaves one hull.
+void ToleranceDecidesHullCount(IVHACD& v)
+{
+    IVHACD::Parameters tight = DefaultParams();
+    tight.m_maxConvexHulls = 64;
+    CHECK(Run(v, LShape(), tight) == Result::Completed);
+    const uint32_t tightHulls = v.GetNConvexHulls();
+    CHECK(tightHulls > 1);
+    CHECK(!v.GetReport().m_hullBudgetBound);
+    CHECK(v.GetReport().m_tolerance >= tight.m_minTolerance);
+
+    IVHACD::Parameters coarse = tight;
+    coarse.m_minTolerance = 10;
+    coarse.m_maxTolerance = 10;
+    CHECK(Run(v, LShape(), coarse) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 1);
+}
+
+// Gaps a probe sphere cannot enter are filled, so a slot narrower than the probe costs no extra hull,
+// while the same slot keeps its two sides apart once the probe is small enough to enter it.
+void ProbeRadiusFillsNarrowGaps(IVHACD& v)
+{
+    // Two bars with a 0.1 gap between them, joined by a base so the model is one piece.
+    Mesh slotted = Box(1, 1, 0.2);
+    const auto append = [&slotted](const Mesh& part, const double dx, const double dy, const double dz)
+    {
+        const uint32_t offset = uint32_t(slotted.points.size() / 3);
+        for (size_t i = 0; i < part.points.size(); i += 3)
+        {
+            slotted.points.push_back(part.points[i] + dx);
+            slotted.points.push_back(part.points[i + 1] + dy);
+            slotted.points.push_back(part.points[i + 2] + dz);
+        }
+        for (const uint32_t index : part.triangles)
+        {
+            slotted.triangles.push_back(index + offset);
+        }
+    };
+    append(Box(0.45, 1, 1), 0, 0, 0.2);
+    append(Box(0.45, 1, 1), 0.55, 0, 0.2);
+
+    IVHACD::Parameters wide = DefaultParams();
+    wide.m_maxConvexHulls = 32;
+    wide.m_probeRadius = 0.2;
+    CHECK(Run(v, slotted, wide) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 1);
+
+    IVHACD::Parameters narrow = wide;
+    narrow.m_probeRadius = 0.01;
+    CHECK(Run(v, slotted, narrow) == Result::Completed);
     CHECK(v.GetNConvexHulls() > 1);
+}
+
+// Budgets bound the work rather than the quality, and say so.
+void BudgetsAreReported(IVHACD& v)
+{
+    IVHACD::Parameters p = DefaultParams();
+    p.m_maxConvexHulls = 1;
+    CHECK(Run(v, LShape(), p) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 1);
+    CHECK(v.GetReport().m_hullBudgetBound);
+
+    IVHACD::Parameters coarse = DefaultParams();
+    coarse.m_maxVoxels = 1 << 13;
+    CHECK(Run(v, LShape(), coarse) == Result::Completed);
+    CHECK(v.GetReport().m_voxelBudgetBound);
+    CHECK(v.GetReport().m_tolerance > coarse.m_minTolerance);
+    CHECK(v.GetReport().m_voxelCount <= coarse.m_maxVoxels);
+}
+
+// The decomposition rests on one question: does this hull contain a voxel it may not? The scan that
+// answers it walks columns and clips a line against the faces, so it is checked here against the
+// definition itself, evaluated over every voxel centre and every face.
+void HullSpaceTestMatchesBruteForce()
+{
+    // A solid slab with a notch cut out of it, voxelized by hand.
+    VHACD::Volume volume;
+    volume.m_dim = VHACD::Vector3<uint32_t>(24, 20, 16);
+    volume.m_scale = 0.25;
+    volume.m_bounds = VHACD::BoundsAABB(VHACD::Vect3(0, 0, 0),
+                                        VHACD::Vect3(double(volume.m_dim[0]) * volume.m_scale,
+                                                     double(volume.m_dim[1]) * volume.m_scale,
+                                                     double(volume.m_dim[2]) * volume.m_scale));
+    volume.m_data.assign(size_t(volume.m_dim[0]) * volume.m_dim[1] * volume.m_dim[2],
+                         VHACD::VoxelValue::PRIMITIVE_OUTSIDE_SURFACE);
+    for (uint32_t i = 4; i < 20; ++i)
+    {
+        for (uint32_t j = 4; j < 16; ++j)
+        {
+            for (uint32_t k = 4; k < 12; ++k)
+            {
+                const bool notch = i >= 9 && i < 15 && j >= 9;
+                volume.SetVoxel(i, j, k, notch ? VHACD::VoxelValue::PRIMITIVE_OUTSIDE_SURFACE
+                                               : VHACD::VoxelValue::PRIMITIVE_INSIDE_SURFACE);
+            }
+        }
+    }
+
+    VHACD::SpaceModel space;
+    space.Build(volume, 1.5, 3.0);
+    CHECK(space.GetFarVoxelCount() > 0);
+
+    std::mt19937_64 rng(0x5eed);
+    std::uniform_real_distribution<double> coordinate(-1.0, 7.0);
+    int agreements = 0;
+    for (int trial = 0; trial < 200; ++trial)
+    {
+        // A random box, as a hull of its eight corners.
+        std::uniform_real_distribution<double> side(0.2, 3.0);
+        const VHACD::Vect3 low(coordinate(rng), coordinate(rng), coordinate(rng));
+        const VHACD::Vect3 high(low.GetX() + side(rng), low.GetY() + side(rng), low.GetZ() + side(rng));
+        std::vector<VHACD::Vertex> points;
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            points.emplace_back((corner & 1) ? high.GetX() : low.GetX(),
+                                (corner & 2) ? high.GetY() : low.GetY(),
+                                (corner & 4) ? high.GetZ() : low.GetZ());
+        }
+        const std::vector<VHACD::Triangle> triangles = {
+            {0, 2, 1}, {1, 2, 3}, {4, 5, 6}, {5, 7, 6}, {0, 1, 4}, {1, 5, 4},
+            {2, 6, 3}, {3, 6, 7}, {0, 4, 2}, {2, 4, 6}, {1, 3, 5}, {3, 7, 5}};
+
+        // The definition: any far voxel whose centre lies in the box.
+        bool expected = false;
+        for (uint32_t i = 0; i < volume.m_dim[0] && !expected; ++i)
+        {
+            for (uint32_t j = 0; j < volume.m_dim[1] && !expected; ++j)
+            {
+                for (uint32_t k = 0; k < volume.m_dim[2] && !expected; ++k)
+                {
+                    // Voxel (i, j, k) is centred on the minimum of the bounds plus i, j, k voxels.
+                    const VHACD::Vect3 centre(volume.m_bounds.GetMin().GetX() + double(i) * volume.m_scale,
+                                              volume.m_bounds.GetMin().GetY() + double(j) * volume.m_scale,
+                                              volume.m_bounds.GetMin().GetZ() + double(k) * volume.m_scale);
+                    if (space.IsFarVoxel(int32_t(i), int32_t(j), int32_t(k))
+                        && centre.GetX() >= low.GetX() && centre.GetX() <= high.GetX()
+                        && centre.GetY() >= low.GetY() && centre.GetY() <= high.GetY()
+                        && centre.GetZ() >= low.GetZ() && centre.GetZ() <= high.GetZ())
+                    {
+                        expected = true;
+                    }
+                }
+            }
+        }
+        CHECK(space.HullReachesTooFar(points, triangles) == expected);
+        agreements += expected ? 1 : 0;
+    }
+    // The boxes must actually straddle the notch, or the comparison proves nothing.
+    CHECK(agreements > 10);
 }
 
 void EmptyMeshCompletesWithoutHulls(IVHACD& v)
@@ -224,12 +381,11 @@ void EmptyMeshCompletesWithoutHulls(IVHACD& v)
     CHECK(v.GetNConvexHulls() == 0);
 }
 
-void ZeroMinimumEdgeLengthNeverProducesEmptyPieces(IVHACD& v)
+void EveryPieceHasVolume(IVHACD& v)
 {
     IVHACD::Parameters p = DefaultParams();
-    p.m_minEdgeLength = 0;
-    p.m_maxRecursionDepth = 12;
-    p.m_minimumVolumePercentErrorAllowed = 0;
+    p.m_maxConvexHulls = 64;
+    p.m_minTolerance = 0.01;
     CHECK(Run(v, LShape(), p) == Result::Completed);
     CHECK(v.GetNConvexHulls() > 0);
     for (uint32_t i = 0; i < v.GetNConvexHulls(); ++i)
@@ -238,14 +394,6 @@ void ZeroMinimumEdgeLengthNeverProducesEmptyPieces(IVHACD& v)
         v.GetConvexHull(i, ch);
         CHECK(std::isfinite(ch.m_volume) && ch.m_volume > 0);
     }
-}
-
-void DepthZeroDoesNotSplit(IVHACD& v)
-{
-    IVHACD::Parameters p = DefaultParams();
-    p.m_maxRecursionDepth = 0;
-    CHECK(Run(v, LShape(), p) == Result::Completed);
-    CHECK(v.GetNConvexHulls() == 1);
 }
 
 void CancelFromUpdateStopsAndReleasesResults(IVHACD& v)
@@ -641,14 +789,17 @@ int main()
     InvalidMeshIsRejectedAndReleasesResults(*v);
     InvalidParametersAreRejected(*v);
     EmptyMeshCompletesWithoutHulls(*v);
-    ZeroMinimumEdgeLengthNeverProducesEmptyPieces(*v);
-    DepthZeroDoesNotSplit(*v);
+    EveryPieceHasVolume(*v);
     CancelFromUpdateStopsAndReleasesResults(*v);
     ReusedInstanceReproducesResults(*v);
     CenterIsTheSolidCentroid(*v);
     RotatedCubeRemainsOneHull(*v);
+    ToleranceDecidesHullCount(*v);
+    ProbeRadiusFillsNarrowGaps(*v);
+    BudgetsAreReported(*v);
     LimitedHullKeepsFarthestPoints();
     FaceOrientationSignIsExact();
+    HullSpaceTestMatchesBruteForce();
     v->Release();
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures, g_failures == 1 ? "" : "s");

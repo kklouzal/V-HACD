@@ -148,15 +148,16 @@ int main(int argc,const char **argv)
 	{
 		printf("Usage: TestVHACD <wavefront.obj> (options)\n");
 		printf("\n");
-		printf("-h <n>                  : Maximum number of output convex hulls. Default is 64\n");
-		printf("-r <voxelresolution>    : Voxel budget; the longest axis gets floor(1.5 * r^0.33) voxels. Default is 400,000\n");
-		printf("-e <volumeErrorPercent> : Volume error allowed as a percentage. Default is 1%%. Valid range is 0.001 to 10\n");
-		printf("-t <tiltedAllowance>    : Voxel volumes per tilted-surface voxel not counted as volume error. Default is 0.5\n");
-		printf("-d <maxRecursionDepth>  : Pieces at this split depth are not split again. Default value is 10.\n");
+		printf("-h <n>                  : Hull budget: hulls merge past the tolerance only to meet it. Default is 64\n");
+		printf("-e <tolerance>          : How far a hull may stand off the surface, as a fraction of the model's diagonal. Default is 0.01\n");
+		printf("-n <minTolerance>       : Smallest tolerance in model units. Default is 0.01\n");
+		printf("-x <maxTolerance>       : Largest tolerance in model units. Default is 0.03\n");
+		printf("-t <probeRadius>        : Gaps and pockets a sphere of this radius cannot enter are filled. Default is 0.05\n");
+		printf("-r <maxVoxels>          : Voxel budget; a coarser grid, and tolerance, is used when it binds. Default is 8,388,608\n");
+		printf("-d <maxPieces>          : Piece budget: splitting stops here even where a piece reaches too far. Default is 512\n");
 		printf("-s <true/false>         : Whether or not to shrinkwrap output to source mesh. Default is true.\n");
 		printf("-f <fillMode>           : Fill mode. Default is 'flood', also 'surface' and 'raycast' are valid.\n");
-		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 64\n");
-		printf("-l <minEdgeLength>      : Minimum size of a voxel edge. Default value is 2 voxels.\n");
+		printf("-v <maxHullVertCount>   : Maximum number of vertices in the output convex hull. Default value is 32\n");
 		printf("-o <obj/stl/usda>       : Export the convex hulls as a series of wavefront OBJ files, STL files, or a single USDA.\n");
 		printf("-g <true/false>         : If set to false, no logging will be displayed.\n");
 	}
@@ -199,27 +200,53 @@ int main(int argc,const char **argv)
 				else if ( strcmp(option,"-r") == 0 )
 				{
 					int32_t r = atoi(value);
-					if ( r >= 10000 && r <= 10000000 )
+					if ( r >= 4096 )
 					{
-						printf("Voxel Resolution set to: %d\n", r);
-						p.m_resolution = uint32_t(r);
+						printf("Voxel budget set to: %d\n", r);
+						p.m_maxVoxels = uint32_t(r);
 					}
 					else
 					{
-						printf("Invalid voxel resolution must be between 10,000 and 10,000,000 got %d\n", r);
+						printf("Invalid voxel budget, it must be at least 4096, got %d\n", r);
 					}
 				}
 				else if ( strcmp(option,"-e") == 0 )
 				{
 					double e = atof(value);
-					if ( e < 0.001 || e > 10 )
+					if ( !std::isfinite(e) || e <= 0 )
 					{
-						printf("Invalid error percentage. Valid values are 0.001 to 10, got %f%%\n", e);
+						printf("Invalid relative tolerance. It must be finite and positive, got %f\n", e);
 					}
 					else
 					{
-						p.m_minimumVolumePercentErrorAllowed = e;
-						printf("Minimum volume error allowed set to: %0.2f%%\n", p.m_minimumVolumePercentErrorAllowed);
+						p.m_relativeTolerance = e;
+						printf("Relative tolerance set to: %0.4f of the model diagonal\n", p.m_relativeTolerance);
+					}
+				}
+				else if ( strcmp(option,"-n") == 0 )
+				{
+					double n = atof(value);
+					if ( !std::isfinite(n) || n <= 0 )
+					{
+						printf("Invalid minimum tolerance. It must be finite and positive, got %f\n", n);
+					}
+					else
+					{
+						p.m_minTolerance = n;
+						printf("Minimum tolerance set to: %0.4f\n", p.m_minTolerance);
+					}
+				}
+				else if ( strcmp(option,"-x") == 0 )
+				{
+					double x = atof(value);
+					if ( !std::isfinite(x) || x <= 0 )
+					{
+						printf("Invalid maximum tolerance. It must be finite and positive, got %f\n", x);
+					}
+					else
+					{
+						p.m_maxTolerance = x;
+						printf("Maximum tolerance set to: %0.4f\n", p.m_maxTolerance);
 					}
 				}
 				else if ( strcmp(option,"-t") == 0 )
@@ -227,12 +254,12 @@ int main(int argc,const char **argv)
 					double t = atof(value);
 					if ( !std::isfinite(t) || t < 0 )
 					{
-						printf("Invalid tilted-surface allowance. It must be finite and at least 0, got %f\n", t);
+						printf("Invalid probe radius. It must be finite and at least 0, got %f\n", t);
 					}
 					else
 					{
-						p.m_tiltedSurfaceAllowance = t;
-						printf("Tilted-surface allowance set to: %0.2f\n", p.m_tiltedSurfaceAllowance);
+						p.m_probeRadius = t;
+						printf("Probe radius set to: %0.4f\n", p.m_probeRadius);
 					}
 				}
 				else if ( strcmp(option,"-o") == 0 )
@@ -260,14 +287,14 @@ int main(int argc,const char **argv)
 				else if ( strcmp(option,"-d") == 0 )
 				{
 					int32_t r = atoi(value);
-					if ( r >= 2 && r <= 64 )
+					if ( r >= 1 )
 					{
-						printf("Maximum recursion depth set to: %d\n", r);
-						p.m_maxRecursionDepth = uint32_t(r);
+						printf("Piece budget set to: %d\n", r);
+						p.m_maxPieces = uint32_t(r);
 					}
 					else
 					{
-						printf("Invalid maximum recursion depth, must be between 2 and 64, got %d\n", r);
+						printf("Invalid piece budget, it must be at least 1, got %d\n", r);
 					}
 				}
 				else if ( strcmp(option,"-s") == 0 )
@@ -332,19 +359,6 @@ int main(int argc,const char **argv)
 					else
 					{
 						printf("Invalid maximum hull vertices, must be between 8 and 20484, got %d\n", r);
-					}
-				}
-				else if ( strcmp(option,"-l") == 0 )
-				{
-					int32_t r = atoi(value);
-					if ( r >= 1 && r <= 32 )
-					{
-						printf("Minimum voxel edge length set to: %d\n", r);
-						p.m_minEdgeLength = uint32_t(r);
-					}
-					else
-					{
-						printf("Invalid minimum voxel edge length, must be between 1 and 32, got %d\n", r);
 					}
 				}
 			}

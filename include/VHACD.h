@@ -352,15 +352,46 @@ public:
     public:
         IUserCallback*      m_callback{nullptr};            // Optional user provided callback interface for progress
         IUserLogger*        m_logger{nullptr};              // Optional user provided callback interface for log messages
-        uint32_t            m_maxConvexHulls{ 64 };         // The maximum number of convex hulls to produce; at least 1
-        uint32_t            m_resolution{ 400000 };         // Voxel budget. The longest axis receives floor(1.5 * m_resolution^0.33) voxels (at least 32, at most 1021)
-        double              m_minimumVolumePercentErrorAllowed{ 1 }; // A piece stops splitting once its hull volume is within this percentage of its voxel volume; finite and >= 0
-        double              m_tiltedSurfaceAllowance{ 0.5 }; // Voxel volumes of hull excess per tilted-surface voxel not counted as volume error; finite and >= 0 (see VoxelHull::ComputeConvexHull)
-        uint32_t            m_maxRecursionDepth{ 10 };      // Pieces at this split depth are not split again (the root is depth 0), so at most 2^depth pieces precede merging
+        // How far a hull may stand off the surface the probe below can reach, in the units of the input.
+        // The tolerance used is clamp(m_relativeTolerance * bounding box diagonal, m_minTolerance,
+        // m_maxTolerance); it also sets the voxel size, so a model is decomposed to the accuracy asked of
+        // it. The hull count follows from it: pieces split while their hull reaches too far, and merge
+        // while the merged hull does not. All three must be finite and positive.
+        double              m_relativeTolerance{ 0.01 };
+        double              m_minTolerance{ 0.01 };
+        double              m_maxTolerance{ 0.03 };
+        // Gaps, openings and pockets a sphere of this radius cannot enter from outside are filled, so hulls
+        // may cover them: nothing of that size can occupy them. 0 keeps every reachable pocket and fills
+        // only sealed cavities. Finite and non-negative.
+        double              m_probeRadius{ 0.05 };
+        // Voxel budget. The voxel size, and with it the tolerance, is coarsened when the tolerance would
+        // need a finer grid than this; IVHACD::GetReport records what was used.
+        uint32_t            m_maxVoxels{ 512u << 10 };
+        // Hull budget. The count normally follows from the tolerance; hulls merge past the tolerance only
+        // to meet this bound, which the report records. At least 1.
+        uint32_t            m_maxConvexHulls{ 64 };
+        // Piece budget. Splitting stops here even where a piece still reaches too far, which bounds the
+        // work of a model whose detail the tolerance cannot capture. At least m_maxConvexHulls.
+        uint32_t            m_maxPieces{ 512 };
+        uint32_t            m_maxNumVerticesPerCH{ 32 };    // The maximum number of vertices allowed in any output convex hull; at least 4. A hull over the limit keeps the vertices farthest out first
         bool                m_shrinkWrap{true};             // Whether or not to shrinkwrap the voxel positions to the source mesh on output
         FillMode            m_fillMode{ FillMode::FLOOD_FILL }; // How to fill the interior of the voxelized mesh
-        uint32_t            m_maxNumVerticesPerCH{ 64 };    // The maximum number of vertices allowed in any output convex hull; at least 4. A hull over the limit keeps the vertices farthest out first
-        uint32_t            m_minEdgeLength{ 2 };           // A piece whose voxel extent is at most this on all 3 axes is not split again
+    };
+
+    /**
+    * What a decomposition used, so a caller can log the models its budgets constrained.
+    */
+    class Report
+    {
+    public:
+        double      m_tolerance{ 0 };            // Tolerance used, in the units of the input
+        double      m_probeRadius{ 0 };          // Probe radius used, in the units of the input
+        double      m_voxelSize{ 0 };            // Edge length of one voxel, in the units of the input
+        uint32_t    m_voxelCount{ 0 };           // Voxels in the grid
+        uint32_t    m_pieceCount{ 0 };           // Pieces the splitting produced, before any merging
+        bool        m_pieceBudgetBound{ false }; // Splitting stopped at m_maxPieces, so a piece may reach too far
+        bool        m_voxelBudgetBound{ false }; // m_maxVoxels forced a coarser tolerance than requested
+        bool        m_hullBudgetBound{ false };  // Hulls merged past the tolerance to meet m_maxConvexHulls
     };
 
     /**
@@ -411,6 +442,11 @@ public:
                          const uint32_t* const triangles,
                          const uint32_t countTriangles,
                          const Parameters& params) = 0;
+
+    /**
+    * Returns what the last Compute used: its tolerance, voxel size and whether a budget constrained it.
+    */
+    virtual const Report& GetReport() const = 0;
 
     /**
     * Returns the number of convex hulls that were produced.
@@ -801,7 +837,9 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
+#include <new>
 #include <queue>
 #include <unordered_map>
 #include <utility>
@@ -2948,12 +2986,10 @@ class Voxel
     static constexpr int VoxelBitsYStart = 10;
     static constexpr int VoxelBitsXStart = 20;
     static constexpr int VoxelBitMask = 0x03FF; // bits 0 through 9 inclusive
-    static constexpr uint32_t TiltedSurfaceBit = uint32_t(1) << 30;
 public:
     Voxel(uint32_t x,
           uint32_t y,
-          uint32_t z,
-          bool onTiltedSurface = false);
+          uint32_t z);
 
     VHACD::Vector3<uint32_t> GetVoxel() const;
 
@@ -2961,19 +2997,14 @@ public:
     uint32_t GetY() const;
     uint32_t GetZ() const;
 
-    // True for a surface voxel produced by a triangle that is not axis aligned
-    bool IsOnTiltedSurface() const;
-
 private:
     uint32_t m_voxel{ 0 };
 };
 
 Voxel::Voxel(uint32_t x,
              uint32_t y,
-             uint32_t z,
-             bool onTiltedSurface)
-    : m_voxel((x << VoxelBitsXStart) | (y << VoxelBitsYStart) | (z << VoxelBitsZStart) |
-              (onTiltedSurface ? TiltedSurfaceBit : 0))
+             uint32_t z)
+    : m_voxel((x << VoxelBitsXStart) | (y << VoxelBitsYStart) | (z << VoxelBitsZStart))
 {
     assert(x < 1024 && "Voxel constructed with X outside of range");
     assert(y < 1024 && "Voxel constructed with Y outside of range");
@@ -2983,11 +3014,6 @@ Voxel::Voxel(uint32_t x,
 VHACD::Vector3<uint32_t> Voxel::GetVoxel() const
 {
     return VHACD::Vector3<uint32_t>(GetX(), GetY(), GetZ());
-}
-
-bool Voxel::IsOnTiltedSurface() const
-{
-    return (m_voxel & TiltedSurfaceBit) != 0;
 }
 
 uint32_t Voxel::GetX() const
@@ -3786,7 +3812,8 @@ public:
     // Returns early with a partial volume once callbacks report cancellation.
     void Voxelize(const std::vector<VHACD::Vertex>& points,
                   const std::vector<VHACD::Triangle>& triangles,
-                  const size_t dim,
+                  double voxelSize,
+                  uint32_t pad,
                   FillMode fillMode,
                   const AABBTree& aabbTree,
                   VHACDCallbacks& callbacks);
@@ -3966,63 +3993,37 @@ bool TriBoxOverlap(const VHACD::Vect3& boxCenter,
     return true; /* box and triangle overlaps */
 }
 
-// Voxels along the longest axis for a requested resolution. The other axes receive at most two more.
-inline size_t VoxelDimensionForResolution(const size_t resolution)
-{
-    size_t dim = size_t(std::pow(double(resolution), 0.33) * double(1.5));
-    return std::max(dim, size_t(32));
-}
-
 // Voxel packs voxel coordinates into 10 bits each. A coordinate on a shorter axis reaches the
 // longest-axis count plus one, so that count must stay below 1023.
 constexpr size_t MaxVoxelDimension = 1021;
 
 void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                       const std::vector<VHACD::Triangle>& indices,
-                      const size_t dimensions,
+                      const double voxelSize,
+                      const uint32_t pad,
                       FillMode fillMode,
                       const AABBTree& aabbTree,
                       VHACDCallbacks& callbacks)
 {
-    const size_t dim = VoxelDimensionForResolution(dimensions);
-    assert(dim <= MaxVoxelDimension);
-
     if (points.size() == 0)
     {
         return;
     }
 
-    m_bounds = BoundsAABB(points);
-
-    VHACD::Vect3 d = m_bounds.GetSize();
-    double r;
-    // Equal comparison is important here to avoid taking the last branch when d[0] == d[1] with d[2] being the smallest
-    // dimension. That would lead to dimensions in i and j to be a lot bigger than expected and make the amount of
-    // voxels in the volume totally unmanageable.
-    if (d[0] >= d[1] && d[0] >= d[2])
+    // The grid holds the mesh plus pad voxels of empty space on every side, which is the room the probe
+    // sphere of SpaceModel needs to reach around the mesh.
+    const VHACD::BoundsAABB meshBounds(points);
+    const VHACD::Vect3 d = meshBounds.GetSize();
+    const double padding = double(pad) * voxelSize;
+    m_bounds = VHACD::BoundsAABB(meshBounds.GetMin() - padding,
+                                 meshBounds.GetMax() + padding);
+    m_scale = voxelSize;
+    const double invScale = double(1.0) / voxelSize;
+    for (int32_t axis = 0; axis < 3; ++axis)
     {
-        r = d[0];
-        m_dim[0] = uint32_t(dim);
-        m_dim[1] = uint32_t(2 + static_cast<size_t>(dim * d[1] / d[0]));
-        m_dim[2] = uint32_t(2 + static_cast<size_t>(dim * d[2] / d[0]));
+        m_dim[axis] = uint32_t(size_t(d[axis] * invScale) + 1 + 2 * size_t(pad));
+        assert(m_dim[axis] <= MaxVoxelDimension);
     }
-    else if (d[1] >= d[0] && d[1] >= d[2])
-    {
-        r = d[1];
-        m_dim[1] = uint32_t(dim);
-        m_dim[0] = uint32_t(2 + static_cast<size_t>(dim * d[0] / d[1]));
-        m_dim[2] = uint32_t(2 + static_cast<size_t>(dim * d[2] / d[1]));
-    }
-    else
-    {
-        r = d[2];
-        m_dim[2] = uint32_t(dim);
-        m_dim[0] = uint32_t(2 + static_cast<size_t>(dim * d[0] / d[2]));
-        m_dim[1] = uint32_t(2 + static_cast<size_t>(dim * d[1] / d[2]));
-    }
-
-    m_scale = r / (dim - 1);
-    double invScale = (dim - 1) / r;
 
     m_data = std::vector<VoxelValue>(m_dim[0] * m_dim[1] * m_dim[2],
                                      VoxelValue::PRIMITIVE_UNDEFINED);
@@ -4069,13 +4070,6 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                 k1 = std::max(k1, k);
             }
         }
-        // A triangle is tilted when its normal leaves an axis by more than about half a degree. Below
-        // that, a staircase step spans more than 100 voxels, longer than the pieces that measure it.
-        const VHACD::Vect3 normal = (p[1] - p[0]).Cross(p[2] - p[0]);
-        const double nx = std::abs(normal[0]);
-        const double ny = std::abs(normal[1]);
-        const double nz = std::abs(normal[2]);
-        const bool tilted = std::max({nx, ny, nz}) < 0.99 * (nx + ny + nz);
         if (i0 > 0)
             --i0;
         if (j0 > 0)
@@ -4111,8 +4105,7 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                         value = VoxelValue::PRIMITIVE_ON_SURFACE;
                         m_surfaceVoxels.emplace_back(uint32_t(i_id),
                                                      uint32_t(j_id),
-                                                     uint32_t(k_id),
-                                                     tilted);
+                                                     uint32_t(k_id));
                     }
                 }
             }
@@ -4465,6 +4458,717 @@ void Volume::FillInsideSurface(VHACDCallbacks& callbacks)
 // * Step #10 : In theory that should work.. let's see...
 
 //***********************************************************************************************
+// Reachable space, the closed solid, and the voxels a hull may not contain
+//***********************************************************************************************
+
+// Everything below works in voxel index space, where voxel (i, j, k) occupies
+// [i, i + 1] x [j, j + 1] x [k, k + 1] and its centre sits at (i + 0.5, j + 0.5, k + 0.5). A point p of
+// the voxelized mesh maps to (p - origin) / scale, where origin is the minimum corner of voxel (0, 0, 0),
+// which is VoxelHull::GetPoint(0, 0, 0).
+
+// Larger than the longest distance any grid can produce, so a line holding no seed never wins a
+// comparison against a line that does.
+constexpr int32_t kNoSeedDistance = 4 * int32_t(MaxVoxelDimension);
+
+inline int64_t FloorDiv(const int64_t numerator, const int64_t denominator)
+{
+    const int64_t quotient = numerator / denominator;
+    return (numerator % denominator != 0 && ((numerator < 0) != (denominator < 0))) ? quotient - 1 : quotient;
+}
+
+// One pass of the separable distance transform over a line: out[u] = min over v of (u - v)^2 + in[v],
+// where in[] already holds squared distances. Lower envelope of parabolas after Meijster, Roerdink and
+// Hesselink, "A general algorithm for computing distance transforms in linear time" (2000). Integer
+// only, so the field is exact and reproduces bit for bit.
+inline void DistanceLinePass(const std::vector<int32_t>& in,
+                             std::vector<int32_t>& out,
+                             std::vector<int32_t>& vertex,
+                             std::vector<int32_t>& boundary)
+{
+    const int32_t count = int32_t(in.size());
+    auto value = [&in](const int64_t x, const int32_t i)
+    {
+        const int64_t delta = x - i;
+        return delta * delta + in[size_t(i)];
+    };
+    // The envelope is built in 64 bits and stored in 32: a squared distance cannot reach 2^31.
+    auto separator = [&in](const int32_t i, const int32_t u)
+    {
+        return FloorDiv(int64_t(u) * u - int64_t(i) * i + in[size_t(u)] - in[size_t(i)], 2 * (int64_t(u) - i));
+    };
+
+    int32_t top = 0;
+    vertex[0] = 0;
+    boundary[0] = 0;
+    for (int32_t u = 1; u < count; ++u)
+    {
+        while (top >= 0 && value(boundary[size_t(top)], vertex[size_t(top)]) > value(boundary[size_t(top)], u))
+        {
+            --top;
+        }
+        if (top < 0)
+        {
+            top = 0;
+            vertex[0] = u;
+        }
+        else
+        {
+            const int64_t crossing = 1 + separator(vertex[size_t(top)], u);
+            if (crossing < count)
+            {
+                ++top;
+                vertex[size_t(top)] = u;
+                boundary[size_t(top)] = crossing;
+            }
+        }
+    }
+    for (int32_t u = count - 1; u >= 0; --u)
+    {
+        out[size_t(u)] = int32_t(value(u, vertex[size_t(top)]));
+        if (u == boundary[size_t(top)])
+        {
+            --top;
+        }
+    }
+}
+
+// Squared distance, in voxel units, from every voxel centre to the nearest centre of a seed voxel.
+// Voxels without any seed in the grid receive a distance larger than the grid can span.
+void SquaredDistanceTransform(const VHACD::Vector3<uint32_t>& dim,
+                              const std::vector<uint8_t>& seeds,
+                              std::vector<int32_t>& distances)
+{
+    const size_t dimX = dim[0];
+    const size_t dimY = dim[1];
+    const size_t dimZ = dim[2];
+    distances.assign(dimX * dimY * dimZ, 0);
+
+    // Pass 1: distance along z inside each (i, j) column, still unsquared.
+    for (size_t i = 0; i < dimX; ++i)
+    {
+        for (size_t j = 0; j < dimY; ++j)
+        {
+            const size_t base = (i * dimY + j) * dimZ;
+            int32_t distance = kNoSeedDistance;
+            for (size_t k = 0; k < dimZ; ++k)
+            {
+                distance = seeds[base + k] ? 0 : std::min(distance + 1, kNoSeedDistance);
+                distances[base + k] = distance;
+            }
+            distance = kNoSeedDistance;
+            for (size_t k = dimZ; k-- > 0;)
+            {
+                distance = seeds[base + k] ? 0 : std::min(distance + 1, kNoSeedDistance);
+                distances[base + k] = std::min(distances[base + k], distance);
+            }
+            for (size_t k = 0; k < dimZ; ++k)
+            {
+                distances[base + k] *= distances[base + k];
+            }
+            static_assert(int64_t(kNoSeedDistance) * kNoSeedDistance < INT32_MAX, "squared distances must fit");
+        }
+    }
+
+    // Pass 2 along y, then pass 3 along x, each gathering a line, transforming it and scattering it back.
+    std::vector<int32_t> line;
+    std::vector<int32_t> result;
+    std::vector<int32_t> vertex;
+    std::vector<int32_t> boundary;
+    const size_t longest = std::max(dimX, dimY);
+    line.reserve(longest);
+    result.reserve(longest);
+    vertex.resize(longest);
+    boundary.resize(longest);
+
+    line.resize(dimY);
+    result.resize(dimY);
+    for (size_t i = 0; i < dimX; ++i)
+    {
+        for (size_t k = 0; k < dimZ; ++k)
+        {
+            for (size_t j = 0; j < dimY; ++j)
+            {
+                line[j] = distances[(i * dimY + j) * dimZ + k];
+            }
+            DistanceLinePass(line, result, vertex, boundary);
+            for (size_t j = 0; j < dimY; ++j)
+            {
+                distances[(i * dimY + j) * dimZ + k] = result[j];
+            }
+        }
+    }
+
+    line.resize(dimX);
+    result.resize(dimX);
+    for (size_t j = 0; j < dimY; ++j)
+    {
+        for (size_t k = 0; k < dimZ; ++k)
+        {
+            for (size_t i = 0; i < dimX; ++i)
+            {
+                line[i] = distances[(i * dimY + j) * dimZ + k];
+            }
+            DistanceLinePass(line, result, vertex, boundary);
+            for (size_t i = 0; i < dimX; ++i)
+            {
+                distances[(i * dimY + j) * dimZ + k] = result[i];
+            }
+        }
+    }
+}
+
+// Voxels per tolerance. A hull face can pass between voxel centres and the far test spares voxels within
+// one voxel of the closed solid, so two voxels per tolerance keep the true error near the tolerance.
+// The notches of a voxel staircase, at most sqrt(3) voxels from the solid, need one more: a probe closing
+// two voxels wide swallows them, and where there is none the third voxel of margin does instead. Tilted
+// solids stay whole either way, and at two voxels a model costs 3.4 times fewer voxels.
+constexpr double kVoxelsPerToleranceClosed = 2.0;
+constexpr double kVoxelsPerToleranceOpen = 3.0;
+
+// Voxels along the longest axis of the smallest model, so even a model smaller than its tolerance keeps a
+// recognizable shape.
+constexpr uint32_t kMinVoxelsPerModel = 16;
+
+// The voxel size for a tolerance, coarsened until the padded grid fits the voxel budget and the voxels
+// per axis the Voxel packing allows. Extents are in the same units as the tolerance.
+struct GridSizing
+{
+    double      m_voxelSize{ 0 };
+    uint32_t    m_pad{ 0 };
+    double      m_voxelsPerTolerance{ kVoxelsPerToleranceOpen };
+    bool        m_budgetBound{ false };
+};
+
+inline GridSizing ChooseGrid(const VHACD::Vect3& extent,
+                             const double tolerance,
+                             const double probeRadius,
+                             const uint32_t maxVoxels)
+{
+    const double longest = std::max({ extent[0], extent[1], extent[2], std::numeric_limits<double>::min() });
+    GridSizing sizing;
+    sizing.m_voxelSize = std::min(tolerance / kVoxelsPerToleranceClosed, longest / double(kMinVoxelsPerModel));
+    sizing.m_voxelsPerTolerance = kVoxelsPerToleranceClosed;
+    if (probeRadius < 2 * sizing.m_voxelSize)
+    {
+        sizing.m_voxelSize = std::min(tolerance / kVoxelsPerToleranceOpen, longest / double(kMinVoxelsPerModel));
+        sizing.m_voxelsPerTolerance = kVoxelsPerToleranceOpen;
+    }
+    for (uint32_t attempt = 0; attempt < 64; ++attempt)
+    {
+        // The probe needs its radius of empty space, plus a voxel for the far test and one to keep the
+        // mesh off the boundary.
+        sizing.m_pad = uint32_t(std::ceil(probeRadius / sizing.m_voxelSize)) + 2;
+        double count = 1;
+        double widest = 0;
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            const double side = std::floor(extent[axis] / sizing.m_voxelSize) + 1 + 2 * double(sizing.m_pad);
+            count *= side;
+            widest = std::max(widest, side);
+        }
+        if (count <= double(maxVoxels) && widest <= double(MaxVoxelDimension))
+        {
+            return sizing;
+        }
+        sizing.m_budgetBound = true;
+        // A coarser grid may no longer resolve the probe, and then the margin has to do the work again.
+        if (probeRadius < 2 * sizing.m_voxelSize)
+        {
+            sizing.m_voxelsPerTolerance = kVoxelsPerToleranceOpen;
+        }
+        sizing.m_voxelSize *= std::max({ std::cbrt(count / double(maxVoxels)),
+                                         widest / double(MaxVoxelDimension),
+                                         double(1.02) });
+    }
+    return sizing;
+}
+
+// The space a probe sphere reaches, the solid that closing leaves behind, and the voxels a hull may not
+// contain.
+//
+// A decomposition may fill anything nothing can reach: gaps narrower than the probe, pockets behind a
+// narrow neck, and sealed cavities. What it may not do is stand more than the tolerance away from that
+// closed solid where a probe can be. Both the split test and the merge test reduce to one question:
+// does this hull contain a voxel centre of the far set?
+class SpaceModel
+{
+public:
+    // probeRadius and tolerance are in voxels.
+    void Build(const Volume& volume,
+               double probeRadius,
+               double tolerance);
+
+    // True when a voxel centre inside the hull lies farther than the tolerance from the closed solid.
+    bool HullReachesTooFar(const std::vector<VHACD::Vertex>& points,
+                           const std::vector<VHACD::Triangle>& triangles) const;
+
+    // The same test for a hull still held by the builder, which merge candidates are.
+    bool HullReachesTooFar(const std::vector<VHACD::Vect3>& points,
+                           const std::vector<VHACD::ConvexHullFace>& faces) const;
+
+    // True when the segment between two points passes through a voxel no hull may cover. Any hull holding
+    // both points holds the segment, so this rejects a merge without building anything.
+    bool SegmentReachesTooFar(const VHACD::Vect3& from,
+                              const VHACD::Vect3& to) const;
+
+    // False when nothing inside this box may be covered, which settles a hull inside the box in constant
+    // time. It only reads the columns the box spans, so it can answer true for a box that in fact holds
+    // no far voxel; every caller treats that as "look closer".
+    bool BoxMayHoldFarVoxel(const VHACD::Vect3& low,
+                            const VHACD::Vect3& high) const;
+
+    uint64_t GetFarVoxelCount() const
+    {
+        return m_farVoxelCount;
+    }
+
+    // True when no hull may cover this voxel's centre.
+    bool IsFarVoxel(int32_t i, int32_t j, int32_t k) const;
+
+private:
+    struct Plane
+    {
+        VHACD::Vect3 m_normal; // Outward, unit length
+        double m_offset;       // A point x is inside when m_normal.Dot(x) + m_offset <= 0
+    };
+
+    // The test both entry points share: index-space points, and face corners as indices into them.
+    bool ReachesTooFar(const std::vector<VHACD::Vect3>& local,
+                       const uint32_t* faceIndices,
+                       size_t faceStride,
+                       size_t faceCount) const;
+
+    // Far voxels in the columns of an index-space rectangle, if any.
+    bool RectangleHasFarVoxel(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) const;
+    bool ScanRectangle(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, const std::vector<Plane>& planes) const;
+    bool ColumnHasFarVoxelInside(uint32_t i, uint32_t j, const std::vector<Plane>& planes) const;
+
+    VHACD::Vector3<uint32_t> m_dim{ 0 };
+    VHACD::Vect3 m_origin{ 0, 0, 0 }; // Minimum corner of voxel (0, 0, 0)
+    double m_scale{ 1.0 };
+    // Far voxels per column as sorted, inclusive z ranges, indexed through m_runStart (one extra entry).
+    std::vector<uint32_t> m_runStart;
+    std::vector<uint16_t> m_runZ;
+    // Summed far-voxel counts over columns, (dimX + 1) by (dimY + 1), for empty-rectangle tests.
+    std::vector<uint32_t> m_columnSum;
+    uint64_t m_farVoxelCount{ 0 };
+};
+
+void SpaceModel::Build(const Volume& volume,
+                       const double probeRadius,
+                       const double tolerance)
+{
+    m_dim = volume.GetDimensions();
+    m_scale = volume.GetScale();
+    m_origin = volume.GetBounds().GetMin() - m_scale * double(0.5);
+    m_farVoxelCount = 0;
+
+    const size_t dimX = m_dim[0];
+    const size_t dimY = m_dim[1];
+    const size_t dimZ = m_dim[2];
+    const size_t voxelCount = dimX * dimY * dimZ;
+
+    std::vector<uint8_t> mask(voxelCount, 0);
+    std::vector<int32_t> field(voxelCount, 0);
+    m_runStart.assign(dimX * dimY + 1, 0);
+    m_columnSum.assign((dimX + 1) * (dimY + 1), 0);
+
+    // The solid: everything the voxelizer marked as surface or interior.
+    for (size_t index = 0; index < voxelCount; ++index)
+    {
+        const VoxelValue value = volume.m_data[index];
+        mask[index] = (value == VoxelValue::PRIMITIVE_ON_SURFACE || value == VoxelValue::PRIMITIVE_INSIDE_SURFACE) ? 1 : 0;
+    }
+    SquaredDistanceTransform(m_dim, mask, field);
+
+    // Centres where a probe sphere fits clear of every solid voxel cube, flood filled from the padded
+    // grid boundary: what the probe cannot reach from outside is filled.
+    const double clearance = probeRadius + std::sqrt(double(3.0)) * double(0.5);
+    const int32_t clearanceSquared = int32_t(std::ceil(clearance * clearance));
+    std::vector<uint32_t> stack;
+    std::fill(mask.begin(), mask.end(), uint8_t(0));
+    auto visit = [&](const size_t index)
+    {
+        if (!mask[index] && field[index] >= clearanceSquared)
+        {
+            mask[index] = 1;
+            stack.push_back(uint32_t(index));
+        }
+    };
+    for (size_t i = 0; i < dimX; ++i)
+    {
+        for (size_t j = 0; j < dimY; ++j)
+        {
+            for (size_t k = 0; k < dimZ; ++k)
+            {
+                if (i == 0 || j == 0 || k == 0 || i + 1 == dimX || j + 1 == dimY || k + 1 == dimZ)
+                {
+                    visit((i * dimY + j) * dimZ + k);
+                }
+            }
+        }
+    }
+    while (!stack.empty())
+    {
+        const size_t index = stack.back();
+        stack.pop_back();
+        const size_t k = index % dimZ;
+        const size_t j = (index / dimZ) % dimY;
+        const size_t i = index / (dimZ * dimY);
+        if (i > 0)          visit(index - dimY * dimZ);
+        if (i + 1 < dimX)   visit(index + dimY * dimZ);
+        if (j > 0)          visit(index - dimZ);
+        if (j + 1 < dimY)   visit(index + dimZ);
+        if (k > 0)          visit(index - 1);
+        if (k + 1 < dimZ)   visit(index + 1);
+    }
+
+    // The closed solid is everything the probe sphere does not cover from those centres.
+    SquaredDistanceTransform(m_dim, mask, field);
+    const int32_t probeSquared = int32_t(std::min(std::floor(probeRadius * probeRadius), double(INT32_MAX)));
+    for (size_t index = 0; index < voxelCount; ++index)
+    {
+        mask[index] = field[index] > probeSquared ? 1 : 0;
+    }
+
+    // Far voxels: farther than the tolerance from the closed solid. A hull face can pass between voxel
+    // centres, so a voxel one step nearer than the tolerance is left alone; with a tolerance of at least
+    // three voxels this also keeps the notches of a voxel staircase, at most sqrt(3) voxels from solid,
+    // out of the far set, so tilted solids are not split.
+    SquaredDistanceTransform(m_dim, mask, field);
+    const double reach = std::max(tolerance - double(1.0), double(0.0));
+    const int32_t reachSquared = int32_t(std::min(std::floor(reach * reach), double(INT32_MAX)));
+
+    m_runZ.clear();
+    for (size_t i = 0; i < dimX; ++i)
+    {
+        for (size_t j = 0; j < dimY; ++j)
+        {
+            const size_t column = i * dimY + j;
+            const size_t base = column * dimZ;
+            m_runStart[column] = uint32_t(m_runZ.size());
+            uint32_t count = 0;
+            size_t k = 0;
+            while (k < dimZ)
+            {
+                if (field[base + k] > reachSquared)
+                {
+                    const size_t start = k;
+                    while (k + 1 < dimZ && field[base + k + 1] > reachSquared)
+                    {
+                        ++k;
+                    }
+                    m_runZ.push_back(uint16_t(start));
+                    m_runZ.push_back(uint16_t(k));
+                    count += uint32_t(k - start + 1);
+                }
+                ++k;
+            }
+            m_columnSum[(i + 1) * (dimY + 1) + (j + 1)] = count;
+            m_farVoxelCount += count;
+        }
+    }
+    m_runStart[dimX * dimY] = uint32_t(m_runZ.size());
+
+    for (size_t i = 1; i <= dimX; ++i)
+    {
+        for (size_t j = 1; j <= dimY; ++j)
+        {
+            m_columnSum[i * (dimY + 1) + j] += m_columnSum[(i - 1) * (dimY + 1) + j]
+                                             + m_columnSum[i * (dimY + 1) + (j - 1)]
+                                             - m_columnSum[(i - 1) * (dimY + 1) + (j - 1)];
+        }
+    }
+}
+
+bool SpaceModel::IsFarVoxel(const int32_t i,
+                            const int32_t j,
+                            const int32_t k) const
+{
+    if (i < 0 || j < 0 || k < 0
+        || uint32_t(i) >= m_dim[0] || uint32_t(j) >= m_dim[1] || uint32_t(k) >= m_dim[2])
+    {
+        return false;
+    }
+    const size_t column = size_t(i) * m_dim[1] + size_t(j);
+    for (uint32_t run = m_runStart[column]; run < m_runStart[column + 1]; run += 2)
+    {
+        if (uint32_t(k) < m_runZ[run])
+        {
+            return false;
+        }
+        if (uint32_t(k) <= m_runZ[run + 1])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SpaceModel::BoxMayHoldFarVoxel(const VHACD::Vect3& low,
+                                    const VHACD::Vect3& high) const
+{
+    if (m_farVoxelCount == 0)
+    {
+        return false;
+    }
+    const double invScale = double(1.0) / m_scale;
+    const VHACD::Vect3 first = (low - m_origin) * invScale;
+    const VHACD::Vect3 last = (high - m_origin) * invScale;
+    const double x0 = std::ceil(first.GetX() - double(0.5));
+    const double y0 = std::ceil(first.GetY() - double(0.5));
+    const double x1 = std::floor(last.GetX() - double(0.5));
+    const double y1 = std::floor(last.GetY() - double(0.5));
+    if (x1 < double(0.0) || y1 < double(0.0)
+        || x0 > double(m_dim[0] - 1) || y0 > double(m_dim[1] - 1)
+        || x1 < x0 || y1 < y0)
+    {
+        return false;
+    }
+    return RectangleHasFarVoxel(uint32_t(std::max(x0, double(0.0))),
+                                uint32_t(std::max(y0, double(0.0))),
+                                uint32_t(std::min(x1, double(m_dim[0] - 1))),
+                                uint32_t(std::min(y1, double(m_dim[1] - 1))));
+}
+
+bool SpaceModel::SegmentReachesTooFar(const VHACD::Vect3& from,
+                                      const VHACD::Vect3& to) const
+{
+    if (m_farVoxelCount == 0)
+    {
+        return false;
+    }
+    const double invScale = double(1.0) / m_scale;
+    const VHACD::Vect3 start = (from - m_origin) * invScale;
+    const VHACD::Vect3 end = (to - m_origin) * invScale;
+    const VHACD::Vect3 delta = end - start;
+    // One sample per voxel of the longest axis keeps every voxel the segment crosses in reach of a sample.
+    const double span = std::max({ std::abs(delta.GetX()), std::abs(delta.GetY()), std::abs(delta.GetZ()) });
+    const int32_t steps = int32_t(std::min(std::ceil(span), double(3 * MaxVoxelDimension))) + 1;
+    for (int32_t step = 0; step <= steps; ++step)
+    {
+        const VHACD::Vect3 point = start + delta * (double(step) / double(steps));
+        if (IsFarVoxel(int32_t(std::floor(point.GetX())),
+                       int32_t(std::floor(point.GetY())),
+                       int32_t(std::floor(point.GetZ()))))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SpaceModel::RectangleHasFarVoxel(const uint32_t x0,
+                                      const uint32_t y0,
+                                      const uint32_t x1,
+                                      const uint32_t y1) const
+{
+    const size_t stride = size_t(m_dim[1]) + 1;
+    const uint32_t total = m_columnSum[size_t(x1 + 1) * stride + (y1 + 1)]
+                         - m_columnSum[size_t(x0) * stride + (y1 + 1)]
+                         - m_columnSum[size_t(x1 + 1) * stride + y0]
+                         + m_columnSum[size_t(x0) * stride + y0];
+    return total != 0;
+}
+
+bool SpaceModel::ColumnHasFarVoxelInside(const uint32_t i,
+                                         const uint32_t j,
+                                         const std::vector<Plane>& planes) const
+{
+    const size_t column = size_t(i) * m_dim[1] + j;
+    const uint32_t runBegin = m_runStart[column];
+    const uint32_t runEnd = m_runStart[column + 1];
+    if (runBegin == runEnd)
+    {
+        return false;
+    }
+
+    // Clip the line through this column's voxel centres against the hull.
+    const double centreX = double(i) + double(0.5);
+    const double centreY = double(j) + double(0.5);
+    double low = -std::numeric_limits<double>::max();
+    double high = std::numeric_limits<double>::max();
+    for (const Plane& plane : planes)
+    {
+        const double slope = plane.m_normal.GetZ();
+        const double offset = plane.m_normal.GetX() * centreX + plane.m_normal.GetY() * centreY + plane.m_offset;
+        if (slope > double(1e-12))
+        {
+            high = std::min(high, -offset / slope);
+        }
+        else if (slope < double(-1e-12))
+        {
+            low = std::max(low, -offset / slope);
+        }
+        else if (offset > double(0.0))
+        {
+            return false;
+        }
+        if (low > high)
+        {
+            return false;
+        }
+    }
+
+    // Voxel k has its centre at k + 0.5, so the centres inside the hull are the k in [low, high] - 0.5.
+    const double firstExact = std::ceil(low - double(0.5));
+    const double lastExact = std::floor(high - double(0.5));
+    if (lastExact < double(0.0) || firstExact > double(m_dim[2] - 1) || lastExact < firstExact)
+    {
+        return false;
+    }
+    const uint32_t first = uint32_t(std::max(firstExact, double(0.0)));
+    const uint32_t last = uint32_t(std::min(lastExact, double(m_dim[2] - 1)));
+    for (uint32_t run = runBegin; run < runEnd; run += 2)
+    {
+        if (m_runZ[run] > last)
+        {
+            break;
+        }
+        if (m_runZ[run + 1] >= first)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SpaceModel::ScanRectangle(const uint32_t x0,
+                               const uint32_t y0,
+                               const uint32_t x1,
+                               const uint32_t y1,
+                               const std::vector<Plane>& planes) const
+{
+    if (!RectangleHasFarVoxel(x0, y0, x1, y1))
+    {
+        return false;
+    }
+    if (x0 == x1 && y0 == y1)
+    {
+        return ColumnHasFarVoxelInside(x0, y0, planes);
+    }
+    // Halve the longer side: the summed counts skip empty regions without visiting their columns.
+    if (x1 - x0 >= y1 - y0)
+    {
+        const uint32_t middle = x0 + (x1 - x0) / 2;
+        return ScanRectangle(x0, y0, middle, y1, planes) || ScanRectangle(middle + 1, y0, x1, y1, planes);
+    }
+    const uint32_t middle = y0 + (y1 - y0) / 2;
+    return ScanRectangle(x0, y0, x1, middle, planes) || ScanRectangle(x0, middle + 1, x1, y1, planes);
+}
+
+bool SpaceModel::HullReachesTooFar(const std::vector<VHACD::Vertex>& points,
+                                   const std::vector<VHACD::Triangle>& triangles) const
+{
+    if (m_farVoxelCount == 0 || points.size() < 4 || triangles.empty())
+    {
+        return false;
+    }
+    const double invScale = double(1.0) / m_scale;
+    std::vector<VHACD::Vect3> local;
+    local.reserve(points.size());
+    for (const VHACD::Vertex& point : points)
+    {
+        local.push_back((VHACD::Vect3(point) - m_origin) * invScale);
+    }
+    static_assert(sizeof(VHACD::Triangle) == 3 * sizeof(uint32_t), "Triangle must be three indices");
+    return ReachesTooFar(local,
+                         &triangles[0].mI0,
+                         sizeof(VHACD::Triangle) / sizeof(uint32_t),
+                         triangles.size());
+}
+
+bool SpaceModel::HullReachesTooFar(const std::vector<VHACD::Vect3>& points,
+                                   const std::vector<VHACD::ConvexHullFace>& faces) const
+{
+    if (m_farVoxelCount == 0 || points.size() < 4 || faces.empty())
+    {
+        return false;
+    }
+    const double invScale = double(1.0) / m_scale;
+    std::vector<VHACD::Vect3> local;
+    local.reserve(points.size());
+    for (const VHACD::Vect3& point : points)
+    {
+        local.push_back((point - m_origin) * invScale);
+    }
+    static_assert(sizeof(VHACD::ConvexHullFace) >= 3 * sizeof(int32_t), "A face must hold three indices");
+    std::vector<uint32_t> indices;
+    indices.reserve(faces.size() * 3);
+    for (const VHACD::ConvexHullFace& face : faces)
+    {
+        indices.push_back(uint32_t(face.m_index[0]));
+        indices.push_back(uint32_t(face.m_index[1]));
+        indices.push_back(uint32_t(face.m_index[2]));
+    }
+    return ReachesTooFar(local, indices.data(), 3, faces.size());
+}
+
+bool SpaceModel::ReachesTooFar(const std::vector<VHACD::Vect3>& local,
+                               const uint32_t* const faceIndices,
+                               const size_t faceStride,
+                               const size_t faceCount) const
+{
+    // Bounds and centroid of the hull in index space.
+    VHACD::Vect3 low(std::numeric_limits<double>::max());
+    VHACD::Vect3 high(-std::numeric_limits<double>::max());
+    VHACD::Vect3 centroid(0, 0, 0);
+    for (const VHACD::Vect3& position : local)
+    {
+        low = low.CWiseMin(position);
+        high = high.CWiseMax(position);
+        centroid += position;
+    }
+    centroid /= double(local.size());
+
+    const double firstX = std::ceil(low.GetX() - double(0.5));
+    const double lastX = std::floor(high.GetX() - double(0.5));
+    const double firstY = std::ceil(low.GetY() - double(0.5));
+    const double lastY = std::floor(high.GetY() - double(0.5));
+    if (lastX < double(0.0) || lastY < double(0.0)
+        || firstX > double(m_dim[0] - 1) || firstY > double(m_dim[1] - 1)
+        || lastX < firstX || lastY < firstY)
+    {
+        return false;
+    }
+    const uint32_t x0 = uint32_t(std::max(firstX, double(0.0)));
+    const uint32_t x1 = uint32_t(std::min(lastX, double(m_dim[0] - 1)));
+    const uint32_t y0 = uint32_t(std::max(firstY, double(0.0)));
+    const uint32_t y1 = uint32_t(std::min(lastY, double(m_dim[1] - 1)));
+
+    // Face planes, oriented away from the centroid so the test does not depend on winding.
+    std::vector<Plane> planes;
+    planes.reserve(faceCount);
+    for (size_t face = 0; face < faceCount; ++face)
+    {
+        const uint32_t* const corner = faceIndices + face * faceStride;
+        const VHACD::Vect3& a = local[corner[0]];
+        const VHACD::Vect3& b = local[corner[1]];
+        const VHACD::Vect3& c = local[corner[2]];
+        VHACD::Vect3 normal = (b - a).Cross(c - a);
+        const double length = normal.GetNorm();
+        if (!(length > double(1e-12)))
+        {
+            continue;
+        }
+        normal /= length;
+        double offset = -normal.Dot(a);
+        if (normal.Dot(centroid) + offset > double(0.0))
+        {
+            normal = -normal;
+            offset = -offset;
+        }
+        planes.push_back(Plane{ normal, offset });
+    }
+    if (planes.empty())
+    {
+        return false;
+    }
+
+    return ScanRectangle(x0, y0, x1, y1, planes);
+}
+
+//***********************************************************************************************
 // QuickHull implementation
 //***********************************************************************************************
 
@@ -4474,9 +5178,11 @@ void Volume::FillInsideSurface(VHACDCallbacks& callbacks)
 class QuickHull
 {
 public:
+    // distTol is a fraction of the point cloud's diagonal: points within it of the hull are left out.
     uint32_t ComputeConvexHull(ConvexHullWorkspace& workspace,
                                const std::vector<VHACD::Vertex>& vertices,
-                               uint32_t maxHullVertices);
+                               uint32_t maxHullVertices,
+                               double distTol = double(0.0001));
 
     const std::vector<VHACD::Vertex>& GetVertices() const;
     const std::vector<VHACD::Triangle>& GetIndices() const;
@@ -4488,13 +5194,14 @@ private:
 
 uint32_t QuickHull::ComputeConvexHull(ConvexHullWorkspace& workspace,
                                       const std::vector<VHACD::Vertex>& vertices,
-                                      uint32_t maxHullVertices)
+                                      uint32_t maxHullVertices,
+                                      const double distTol)
 {
     m_indices.clear();
 
     VHACD::ConvexHull ch(workspace,
                          vertices,
-                         double(0.0001),
+                         distTol,
                          maxHullVertices);
 
     auto& vlist = ch.GetVertexPool();
@@ -4578,6 +5285,19 @@ enum class SplitAxis
     Z_AXIS_POSITIVE,
 };
 
+// Splitting halves the longest axis of a piece, so a piece reaches one voxel long before this depth.
+// It bounds the recursion should a piece ever fail to shrink.
+constexpr uint32_t MaxSplitDepth = 64;
+
+// Below this a grid cannot hold a mesh and the space around it at any useful tolerance.
+constexpr uint32_t MinVoxelBudget = 4096;
+
+// How much of the tolerance the merge phase spends on simplifying its hulls. The output is reduced to the
+// vertex cap regardless, and merging prices every candidate pair, so hulls that carry a vertex per step of
+// a voxel staircase cost the decomposition dearly; against that, every vertex dropped moves a hull inward
+// and leaves that much of the surface uncovered.
+constexpr double kSimplifyFraction = 0.25;
+
 // This class represents a collection of voxels, the convex hull
 // which surrounds them, and a triangle mesh representation of those voxels
 class VoxelHull
@@ -4591,9 +5311,11 @@ public:
               uint32_t splitLoc);
 
     // Here we construct the initial convex hull around the
-    // entire voxel set. Its pieces build their hulls in hullWorkspace, which must outlive them.
+    // entire voxel set. Its pieces build their hulls in hullWorkspace and test them against space, both
+    // of which must outlive them.
     VoxelHull(Volume& voxels,
               ConvexHullWorkspace& hullWorkspace,
+              const SpaceModel& space,
               const IVHACD::Parameters &params);
 
     ~VoxelHull() = default;
@@ -4604,8 +5326,9 @@ public:
     // Computes the convex hull of the corner points gathered by CollectHullPoints
     void ComputeConvexHull();
 
-    // Returns true if this convex hull should be considered done
-    bool IsComplete();
+    // Returns true if this piece is done: its hull stays within the tolerance of everything the probe
+    // sphere can reach, or the piece cannot be split any further.
+    bool IsComplete() const;
 
 
     // Convert a voxel position into it's correct double precision location
@@ -4630,14 +5353,13 @@ public:
     SplitAxis               m_axis{ SplitAxis::X_AXIS_NEGATIVE };
     Volume*                 m_voxels{ nullptr }; // The voxelized data set
     ConvexHullWorkspace*    m_hullWorkspace{ nullptr }; // Where this piece builds its hull
+    const SpaceModel*       m_space{ nullptr };  // What this piece's hull may and may not cover
     double                  m_voxelScale{ 0 };   // Size of a single voxel
     double                  m_voxelScaleHalf{ 0 }; // 1/2 of the size of a single voxel
     VHACD::BoundsAABB       m_voxelBounds;
     VHACD::Vect3            m_voxelAdjust;       // Minimum coordinates of the voxel space, with adjustment
     uint32_t                m_depth{ 0 };        // How deep in the recursion of the binary tree this hull is
-    double                  m_volumeError{ 0 };  // The percentage error from the convex hull volume vs. the voxel volume
-    double                  m_voxelVolume{ 0 };  // The volume of the voxels
-    double                  m_hullVolume{ 0 };   // The volume of the enclosing convex hull
+    bool                    m_reachesTooFar{ false }; // The hull covers space no hull may cover, so the piece splits
 
     std::unique_ptr<IVHACD::ConvexHull> m_convexHull{ nullptr }; // The convex hull which encloses this set of voxels.
     std::vector<Voxel>                  m_surfaceVoxels;     // The voxels which are on the surface of the source mesh.
@@ -4662,6 +5384,7 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
     : m_axis(axis)
     , m_voxels(parent.m_voxels)
     , m_hullWorkspace(parent.m_hullWorkspace)
+    , m_space(parent.m_space)
     , m_voxelScale(m_voxels->GetScale())
     , m_voxelScaleHalf(m_voxelScale * double(0.5))
     , m_voxelBounds(m_voxels->GetBounds())
@@ -4795,9 +5518,11 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
 
 VoxelHull::VoxelHull(Volume& voxels,
                      ConvexHullWorkspace& hullWorkspace,
+                     const SpaceModel& space,
                      const IVHACD::Parameters& params)
     : m_voxels(&voxels)
     , m_hullWorkspace(&hullWorkspace)
+    , m_space(&space)
     , m_voxelScale(m_voxels->GetScale())
     , m_voxelScaleHalf(m_voxelScale * double(0.5))
     , m_voxelBounds(m_voxels->GetBounds())
@@ -4840,57 +5565,23 @@ void VoxelHull::ComputeConvexHull()
                                                               m_convexHull->m_triangles);
         }
     }
-    if ( m_convexHull )
-    {
-        m_hullVolume = m_convexHull->m_volume;
-    }
-    // This is the volume of a single voxel
-    double singleVoxelVolume = m_voxelScale * m_voxelScale * m_voxelScale;
-    size_t voxelCount = m_interiorVoxels.size() + m_newSurfaceVoxels.size() + m_surfaceVoxels.size();
-    m_voxelVolume = singleVoxelVolume * double(voxelCount);
-    // A hull of voxel corners exceeds the voxels of any tilted surface by a staircase gap even when the
-    // surface is flat: between two steps the hull runs over the step tips while the voxels stay one
-    // step lower, which averages half a voxel per voxel along a run. Axis-aligned surfaces and the
-    // split-plane faces in m_newSurfaceVoxels leave no gap. Without discounting that gap, a flat tilted
-    // face never reaches m_minimumVolumePercentErrorAllowed and every oblique solid, even a rotated cube,
-    // is split to m_maxRecursionDepth.
-    size_t tiltedSurfaceVoxels = 0;
-    for (const Voxel& v : m_surfaceVoxels)
-    {
-        tiltedSurfaceVoxels += v.IsOnTiltedSurface() ? 1 : 0;
-    }
-    const double allowance = m_params.m_tiltedSurfaceAllowance * singleVoxelVolume * double(tiltedSurfaceVoxels);
-    double diff = std::max(fabs(m_hullVolume - m_voxelVolume) - allowance, 0.0);
-    m_volumeError = (diff * 100) / m_voxelVolume;
+    // Whether this hull covers space it may not: farther than the tolerance from anything the probe
+    // sphere cannot reach. That, and nothing about volumes, is what makes a piece split.
+    m_reachesTooFar = m_convexHull
+                   && m_space->HullReachesTooFar(m_convexHull->m_points,
+                                                 m_convexHull->m_triangles);
 }
 
-bool VoxelHull::IsComplete()
+bool VoxelHull::IsComplete() const
 {
-    bool ret = false;
-    if ( m_convexHull == nullptr )
+    if ( m_convexHull == nullptr || !m_reachesTooFar || m_depth >= MaxSplitDepth )
     {
-        ret = true;
+        return true;
     }
-    else if ( m_volumeError < m_params.m_minimumVolumePercentErrorAllowed )
-    {
-        ret = true;
-    }
-    else if ( m_depth >= m_params.m_maxRecursionDepth )
-    {
-        ret = true;
-    }
-    else
-    {
-        // We compute the voxel width on all 3 axes and see if they are below the min threshold size
-        VHACD::Vector3<uint32_t> d = m_2 - m_1;
-        if ( d.GetX() <= m_params.m_minEdgeLength &&
-             d.GetY() <= m_params.m_minEdgeLength &&
-             d.GetZ() <= m_params.m_minEdgeLength )
-        {
-            ret = true;
-        }
-    }
-    return ret;
+    // A single voxel's hull holds only its own centre, which is solid, so it can never reach too far and
+    // the recursion always ends.
+    const VHACD::Vector3<uint32_t> d = m_2 - m_1;
+    return d.GetX() == 0 && d.GetY() == 0 && d.GetZ() == 0;
 }
 
 VHACD::Vect3 VoxelHull::GetPoint(const int32_t x,
@@ -4982,8 +5673,8 @@ SplitAxis VoxelHull::ComputeSplitPlane(uint32_t& location)
     const VHACD::Vector3<uint32_t> d = m_2 - m_1;
 
     // Voxels at or below location go to the negative side, so location must stay below the region
-    // maximum or the positive side is empty. The midpoint formula reaches the maximum only for an
-    // extent of 1, which IsComplete already rules out whenever m_minEdgeLength >= 1.
+    // maximum or the positive side is empty. The midpoint formula reaches the maximum only for an extent
+    // of 1, and IsComplete already ruled out a piece that spans a single voxel.
     uint32_t axis = 2;
     SplitAxis ret = SplitAxis::Z_AXIS_NEGATIVE;
     if ( d.GetX() >= d.GetY() && d.GetX() >= d.GetZ() )
@@ -4996,8 +5687,7 @@ SplitAxis VoxelHull::ComputeSplitPlane(uint32_t& location)
         axis = 1;
         ret = SplitAxis::Y_AXIS_NEGATIVE;
     }
-    // IsComplete returns true when every extent is at most m_minEdgeLength, so the split axis spans at
-    // least two voxels here.
+    // IsComplete returns true for a piece that spans one voxel, so the split axis spans at least two.
     assert(d[axis] >= 1);
     location = std::min((m_2[axis] + 1 + m_1[axis]) / 2, m_2[axis] - 1);
     return ret;
@@ -5043,7 +5733,8 @@ class CostTask
 public:
     IVHACD::ConvexHull* m_hullA{ nullptr };
     IVHACD::ConvexHull* m_hullB{ nullptr };
-    double              m_concavity{ 0 }; // concavity of the two combined
+    double              m_concavity{ 0 };          // concavity of the two combined
+    bool                m_reachesTooFar{ false };  // the combined hull covers space no hull may cover
 };
 
 class HullPair
@@ -5089,7 +5780,6 @@ bool HullPair::operator<(const HullPair &h) const
 class VHACDImpl : public IVHACD, public VHACDCallbacks
 {
     // Don't consider more than 100,000 convex hulls.
-    static constexpr uint32_t MaxConvexHullFragments{ 100000 };
 public:
     VHACDImpl() = default;
 
@@ -5114,6 +5804,8 @@ public:
                           const uint32_t* const triangles,
                           const uint32_t countTriangles,
                           const Parameters& params) override final;
+
+    const Report& GetReport() const override final;
 
     uint32_t GetNConvexHulls() const override final;
 
@@ -5158,6 +5850,23 @@ public:
 
     void PerformConvexDecomposition();
 
+    // Merging either runs until no pair of hulls may merge, or until the hull budget is met.
+    enum class MergeLimit
+    {
+        Tolerance,
+        Budget
+    };
+
+    void MergeHulls(MergeLimit limit);
+
+    // A hull of the same points within a quarter of the tolerance, and at most the output's vertex count.
+    std::unique_ptr<ConvexHull> SimplifyHull(const ConvexHull& source);
+
+    // Prices a pair and queues it, unless the tolerance rules the merge out.
+    void EvaluatePair(ConvexHull* first,
+                      ConvexHull* second,
+                      MergeLimit limit);
+
     double ComputeConvexHullVolume(const ConvexHull& sm);
 
     double ComputeVolume4(const VHACD::Vect3& a,
@@ -5189,8 +5898,10 @@ public:
                                                           const ConvexHull& sm2);
 
     // The volume of the hull ComputeCombinedConvexHull would build, with the same arithmetic, without building it
+    // Also reports, when asked, whether the combined hull covers space no hull may cover.
     double ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
-                                           const ConvexHull& sm2);
+                                           const ConvexHull& sm2,
+                                           bool* reachesTooFar = nullptr);
 
     // The points of both live hulls, merged in lexicographic order
     std::vector<VHACD::Vertex> MergeHullPoints(const ConvexHull& sm1,
@@ -5229,6 +5940,10 @@ public:
 
     VHACD::AABBTree                                     m_AABBTree;
     VHACD::Volume                                       m_voxelize;
+    // What the probe sphere can reach and how far a hull may stand off it: the whole decomposition's
+    // split and merge decisions come from this.
+    VHACD::SpaceModel                                   m_space;
+    Report                                              m_report;
     // Every hull build of a Compute runs in this workspace, one at a time.
     ConvexHullWorkspace                                 m_hullWorkspace;
     VHACD::Vect3                                        m_center;
@@ -5239,6 +5954,8 @@ public:
 
     double                                              m_overallHullVolume{ double(0.0) };
     double                                              m_voxelScale{ double(0.0) };
+    // The tolerance in the normalized space the decomposition works in.
+    double                                              m_tolerance{ double(0.0) };
     std::priority_queue<HullPair>                       m_hullPairQueue;
     // Hulls being merged, indexed by id. A merged-away hull leaves a null entry, so iterating the
     // table visits live hulls in creation order.
@@ -5287,17 +6004,29 @@ const char* VHACDImpl::ValidateInput(const Coordinate* const points,
     {
         return "m_maxNumVerticesPerCH must be at least 4";
     }
-    if ( !std::isfinite(params.m_minimumVolumePercentErrorAllowed) || params.m_minimumVolumePercentErrorAllowed < 0 )
+    if ( !std::isfinite(params.m_relativeTolerance) || params.m_relativeTolerance <= 0 )
     {
-        return "m_minimumVolumePercentErrorAllowed must be finite and non-negative";
+        return "m_relativeTolerance must be finite and positive";
     }
-    if ( !std::isfinite(params.m_tiltedSurfaceAllowance) || params.m_tiltedSurfaceAllowance < 0 )
+    if ( !std::isfinite(params.m_minTolerance) || params.m_minTolerance <= 0 )
     {
-        return "m_tiltedSurfaceAllowance must be finite and non-negative";
+        return "m_minTolerance must be finite and positive";
     }
-    if ( VoxelDimensionForResolution(params.m_resolution) > MaxVoxelDimension )
+    if ( !std::isfinite(params.m_maxTolerance) || params.m_maxTolerance < params.m_minTolerance )
     {
-        return "m_resolution produces more than 1021 voxels along the longest axis";
+        return "m_maxTolerance must be finite and at least m_minTolerance";
+    }
+    if ( !std::isfinite(params.m_probeRadius) || params.m_probeRadius < 0 )
+    {
+        return "m_probeRadius must be finite and non-negative";
+    }
+    if ( params.m_maxVoxels < MinVoxelBudget )
+    {
+        return "m_maxVoxels must be at least 4096";
+    }
+    if ( params.m_maxPieces < params.m_maxConvexHulls )
+    {
+        return "m_maxPieces must be at least m_maxConvexHulls";
     }
     if ( (countPoints != 0 && points == nullptr) || (countTriangles != 0 && triangles == nullptr) )
     {
@@ -5362,6 +6091,11 @@ IVHACD::ComputeResult VHACDImpl::ComputeFromArrays(const Coordinate* const point
     return Compute(v, t, params);
 }
 
+const IVHACD::Report& VHACDImpl::GetReport() const
+{
+    return m_report;
+}
+
 uint32_t VHACDImpl::GetNConvexHulls() const
 {
     return uint32_t(m_convexHulls.size());
@@ -5398,6 +6132,9 @@ void VHACDImpl::Clean()
 
     m_vertices.clear();
     m_indices.clear();
+    // The grid and its distance fields are the largest allocation of a Compute; release them too.
+    m_voxelize = VHACD::Volume();
+    m_space = VHACD::SpaceModel();
 }
 
 void VHACDImpl::Release()
@@ -5412,6 +6149,7 @@ IVHACD::ComputeResult VHACDImpl::Compute(const std::vector<VHACD::Vertex>& point
     m_params = params;
     m_canceled = false;
     m_progressTimer.Reset();
+    m_report = Report();
 
     CopyInputMesh(points,
                   triangles);
@@ -5564,10 +6302,22 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
         ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
                         0,
                         "Voxelizing Input Mesh");
+        // The tolerance follows the size of the model, within the bounds the caller allows, and the voxel
+        // size follows the tolerance. Both arrive in the units of the input, while everything below works
+        // on the mesh normalized into a unit cube, so both are scaled with it.
+        const double diagonal = (bmax - bmin).GetNorm();
+        const double tolerance = std::min(std::max(m_params.m_relativeTolerance * diagonal,
+                                                   m_params.m_minTolerance),
+                                          m_params.m_maxTolerance);
+        const GridSizing sizing = ChooseGrid((bmax - bmin) * m_recipScale,
+                                             tolerance * m_recipScale,
+                                             m_params.m_probeRadius * m_recipScale,
+                                             m_params.m_maxVoxels);
         m_voxelize = VHACD::Volume();
         m_voxelize.Voxelize(m_vertices,
                             m_indices,
-                            m_params.m_resolution,
+                            sizing.m_voxelSize,
+                            sizing.m_pad,
                             m_params.m_fillMode,
                             m_AABBTree,
                             *this);
@@ -5575,6 +6325,26 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
         ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
                        100,
                        "Voxelization complete");
+
+        if ( !m_canceled )
+        {
+            // A voxel grid resolves nothing below its own voxel, so a budget that coarsened the grid
+            // coarsens the tolerance with it. The report carries what was really used.
+            const double probeVoxels = m_params.m_probeRadius * m_recipScale / sizing.m_voxelSize;
+            const double toleranceVoxels = std::max(tolerance * m_recipScale / sizing.m_voxelSize,
+                                                    sizing.m_voxelsPerTolerance);
+            m_space.Build(m_voxelize,
+                          probeVoxels,
+                          toleranceVoxels);
+
+            const VHACD::Vector3<uint32_t> dim = m_voxelize.GetDimensions();
+            m_tolerance = toleranceVoxels * sizing.m_voxelSize;
+            m_report.m_voxelSize = sizing.m_voxelSize * m_scale;
+            m_report.m_tolerance = toleranceVoxels * m_report.m_voxelSize;
+            m_report.m_probeRadius = m_params.m_probeRadius;
+            m_report.m_voxelCount = dim[0] * dim[1] * dim[2];
+            m_report.m_voxelBudgetBound = sizing.m_budgetBound;
+        }
     }
 
     if ( !m_canceled )
@@ -5584,6 +6354,7 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                         "Build initial ConvexHull");
         std::unique_ptr<VoxelHull> vh = std::unique_ptr<VoxelHull>(new VoxelHull(m_voxelize,
                                                                                  m_hullWorkspace,
+                                                                                 m_space,
                                                                                  m_params));
         if ( vh->m_convexHull )
         {
@@ -5626,24 +6397,25 @@ void VHACDImpl::PerformConvexDecomposition()
     {
         ScopedTime st("Convex Decomposition",
                       m_params.m_logger);
-        double maxHulls = pow(2, m_params.m_maxRecursionDepth);
-        // We recursively split convex hulls until we can
-        // no longer recurse further.
+        // Pieces split while their hull reaches too far, so the share of pieces already finished is what
+        // there is to report.
         while ( !m_pendingHulls.empty() && !m_canceled )
         {
+            // Every split turns one piece into two, so the budget counts the pieces that exist.
             size_t count = m_pendingHulls.size() + m_voxelHulls.size();
             // First we make a copy of the hulls we are processing
             std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
             // Split every hull on this level that is not yet complete
             for (auto& i : oldList)
             {
-                if ( PollProgress(Stages::PERFORMING_DECOMPOSITION, (double(count) * double(100.0)) / maxHulls, "Performing recursive decomposition of convex hulls") )
+                if ( PollProgress(Stages::PERFORMING_DECOMPOSITION, 100.0 * double(m_voxelHulls.size()) / double(count), "Performing recursive decomposition of convex hulls") )
                 {
                     return;
                 }
-                if ( !i->IsComplete() && count <= MaxConvexHullFragments )
+                if ( !i->IsComplete() && count < m_params.m_maxPieces )
                 {
                     i->PerformPlaneSplit();
+                    ++count;
                 }
             }
             // Now, we rebuild the pending convex hulls list by
@@ -5651,8 +6423,9 @@ void VHACDImpl::PerformConvexDecomposition()
             // we need to recurse them further
             for (auto& vh : oldList)
             {
-                if ( vh->IsComplete() || count > MaxConvexHullFragments )
+                if ( vh->IsComplete() || !vh->m_hullA )
                 {
+                    m_report.m_pieceBudgetBound = m_report.m_pieceBudgetBound || !vh->IsComplete();
                     if ( vh->m_convexHull )
                     {
                         m_voxelHulls.push_back(std::move(vh));
@@ -5679,6 +6452,7 @@ void VHACDImpl::PerformConvexDecomposition()
         m_sortedHullPoints.clear();
         m_liveHullCount = 0;
 
+        m_report.m_pieceCount = uint32_t(m_voxelHulls.size());
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
                        0,
                        "Initializing ConvexHulls");
@@ -5688,13 +6462,7 @@ void VHACDImpl::PerformConvexDecomposition()
             {
                 break;
             }
-            ConvexHull* ch = AddHull(std::unique_ptr<ConvexHull>(new ConvexHull(*vh->m_convexHull)));
-            // Compute the volume of the convex hull
-            ch->m_volume = ComputeConvexHullVolume(*ch);
-            // Compute the AABB of the convex hull
-            VHACD::BoundsAABB b = VHACD::BoundsAABB(ch->m_points).Inflate(double(0.1));
-            ch->mBmin = b.GetMin();
-            ch->mBmax = b.GetMax();
+            AddHull(SimplifyHull(*vh->m_convexHull));
         }
         ProgressUpdate(Stages::INITIALIZING_CONVEX_HULLS_FOR_MERGING,
                         100,
@@ -5702,144 +6470,18 @@ void VHACDImpl::PerformConvexDecomposition()
 
         m_voxelHulls.clear();
 
-        // here we merge convex hulls as needed until the match the
-        // desired maximum hull count.
-        size_t hullCount = m_hulls.size();
-
-        if ( hullCount > m_params.m_maxConvexHulls && !m_canceled)
+        // Merging decides the hull count: pairs merge while the merged hull stays within the tolerance
+        // of everything the probe sphere can reach, and what is left when no pair does is the result.
+        if ( !m_canceled )
         {
-            size_t costMatrixSize = ((hullCount * hullCount) - hullCount) >> 1;
-            std::vector<CostTask> tasks;
-            tasks.reserve(costMatrixSize);
+            MergeHulls(MergeLimit::Tolerance);
+        }
 
-            ScopedTime st("Computing the Cost Matrix",
-                          m_params.m_logger);
-            // First thing we need to do is compute the cost matrix
-            // This is computed as the volume error of any two convex hulls
-            // combined
-            ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
-                           0,
-                           "Computing Hull Merge Cost Matrix");
-            for (size_t i = 1; i < hullCount && !m_canceled; i++)
-            {
-                ConvexHull* chA = m_hulls[i].get();
-
-                for (size_t j = 0; j < i && !m_canceled; j++)
-                {
-                    ConvexHull* chB = m_hulls[j].get();
-
-                    CostTask ct;
-                    ct.m_hullA = chA;
-                    ct.m_hullB = chB;
-
-                    if ( !DoFastCost(ct) )
-                    {
-                        tasks.push_back(ct);
-                    }
-                }
-            }
-
-            if ( !m_canceled )
-            {
-                for (CostTask& task : tasks)
-                {
-                    if ( PollProgress(Stages::COMPUTING_COST_MATRIX, 100.0 * double(&task - tasks.data()) / double(tasks.size()), "Computing Hull Merge Cost Matrix") )
-                    {
-                        return;
-                    }
-                    PerformMergeCostTask(task);
-                    AddCostToPriorityQueue(task);
-                }
-                ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
-                               100,
-                               "Finished cost matrix");
-            }
-
-            if ( !m_canceled )
-            {
-                ScopedTime stMerging("Merging Convex Hulls",
-                                     m_params.m_logger);
-                // Now that we know the cost to merge each hull, we can begin merging them.
-
-                uint32_t maxMergeCount = uint32_t(m_liveHullCount) - m_params.m_maxConvexHulls;
-                uint32_t startCount = uint32_t(m_liveHullCount);
-
-                while (    m_liveHullCount > m_params.m_maxConvexHulls
-                        && !m_hullPairQueue.empty()
-                        && !m_canceled)
-                {
-                    const uint32_t hullsProcessed = startCount - uint32_t(m_liveHullCount);
-                    if ( PollProgress(Stages::MERGING_CONVEX_HULLS, double(hullsProcessed) * 100.0 / double(maxMergeCount), "Merging Convex Hulls") )
-                    {
-                        return;
-                    }
-
-                    HullPair hp = m_hullPairQueue.top();
-                    m_hullPairQueue.pop();
-
-                    // It is entirely possible that the hull pair queue can
-                    // have references to convex hulls that are no longer valid
-                    // because they were previously merged. So we check for this
-                    // and if either hull referenced in this pair no longer
-                    // exists, then we skip it.
-
-                    // Look up this pair of hulls by ID
-                    ConvexHull* ch1 = GetHull(hp.m_hullA);
-                    ConvexHull* ch2 = GetHull(hp.m_hullB);
-
-                    // If both hulls are still valid, then we merge them, delete the old
-                    // two hulls and recompute the cost matrix for the new combined hull
-                    // we have created
-                    if ( ch1 && ch2 )
-                    {
-                        // This is the convex hull which results from combining the
-                        // vertices in the two source hulls
-                        std::unique_ptr<ConvexHull> combined = ComputeCombinedConvexHull(*ch1,
-                                                                                         *ch2);
-                        // The two old convex hulls are going to get removed
-                        RemoveHull(hp.m_hullA);
-                        RemoveHull(hp.m_hullB);
-                        // Pairs pushed below carry the combined hull's id, which AddHull assigns as
-                        // the current table size.
-                        combined->m_meshId = uint32_t(m_hulls.size());
-
-                        tasks.clear();
-                        tasks.reserve(m_liveHullCount);
-
-                        // Compute the cost between this new merged hull
-                        // and all existing convex hulls and then
-                        // add that to the priority queue
-                        for (const std::unique_ptr<ConvexHull>& secondHull : m_hulls)
-                        {
-                            if ( m_canceled )
-                            {
-                                break;
-                            }
-                            if ( !secondHull )
-                            {
-                                continue;
-                            }
-                            CostTask ct;
-                            ct.m_hullA = combined.get();
-                            ct.m_hullB = secondHull.get();
-                            if ( !DoFastCost(ct) )
-                            {
-                                tasks.push_back(ct);
-                            }
-                        }
-                        AddHull(std::move(combined));
-                        for (CostTask& task : tasks)
-                        {
-                            PerformMergeCostTask(task);
-                        }
-
-                        for (CostTask& task : tasks)
-                        {
-                            AddCostToPriorityQueue(task);
-                        }
-                    }
-                }
-            }
+        if ( !m_canceled && m_liveHullCount > m_params.m_maxConvexHulls )
+        {
+            // The budget is a hard bound, so the cheapest merges continue past the tolerance to meet it.
+            m_report.m_hullBudgetBound = true;
+            MergeHulls(MergeLimit::Budget);
         }
 
         if ( !m_canceled )
@@ -5875,6 +6517,149 @@ void VHACDImpl::PerformConvexDecomposition()
             ProgressUpdate(Stages::FINALIZING_RESULTS,
                            100,
                            "Finalized results");
+        }
+    }
+}
+
+void VHACDImpl::EvaluatePair(ConvexHull* const first,
+                             ConvexHull* const second,
+                             const MergeLimit limit)
+{
+    // Building a hull for every pair of a large model dominates the decomposition, so the two cheap
+    // answers come first: a merged hull lies inside the bounds of the two hulls together, and it covers
+    // the line between them.
+    if ( limit == MergeLimit::Tolerance )
+    {
+        // Pieces farther apart than a filled gap can only merge through solid lying between them, and a
+        // chain of merges between neighbours reaches that result anyway, so proximity bounds the pairs a
+        // model has to price at all.
+        const double margin = m_params.m_probeRadius * m_recipScale + m_tolerance;
+        for (int32_t axis = 0; axis < 3; ++axis)
+        {
+            if ( first->mBmin[axis] - margin > second->mBmax[axis]
+                 || second->mBmin[axis] - margin > first->mBmax[axis] )
+            {
+                return;
+            }
+        }
+
+        const VHACD::Vect3 low = first->mBmin.CWiseMin(second->mBmin);
+        const VHACD::Vect3 high = first->mBmax.CWiseMax(second->mBmax);
+        if ( m_space.BoxMayHoldFarVoxel(low, high)
+             && m_space.SegmentReachesTooFar(first->m_center, second->m_center) )
+        {
+            return;
+        }
+    }
+
+    CostTask task;
+    task.m_hullA = first;
+    task.m_hullB = second;
+    if ( limit == MergeLimit::Budget && DoFastCost(task) )
+    {
+        // Hulls whose bounds do not meet are priced from those bounds, which the budget is free to accept.
+        return;
+    }
+    PerformMergeCostTask(task);
+    if ( limit == MergeLimit::Tolerance && task.m_reachesTooFar )
+    {
+        return;
+    }
+    AddCostToPriorityQueue(task);
+}
+
+void VHACDImpl::MergeHulls(const MergeLimit limit)
+{
+    ScopedTime stMerging(limit == MergeLimit::Tolerance ? "Merging Convex Hulls"
+                                                        : "Merging Convex Hulls To The Budget",
+                         m_params.m_logger);
+    // Pairs from an earlier pass priced hulls that no longer exist.
+    m_hullPairQueue = std::priority_queue<HullPair>();
+
+    std::vector<ConvexHull*> live;
+    live.reserve(m_liveHullCount);
+    for (const std::unique_ptr<ConvexHull>& hull : m_hulls)
+    {
+        if ( hull )
+        {
+            live.push_back(hull.get());
+        }
+    }
+
+    ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
+                   0,
+                   "Computing Hull Merge Cost Matrix");
+    for (size_t i = 1; i < live.size(); ++i)
+    {
+        if ( PollProgress(Stages::COMPUTING_COST_MATRIX, 100.0 * double(i) / double(live.size()), "Computing Hull Merge Cost Matrix") )
+        {
+            return;
+        }
+        for (size_t j = 0; j < i && !m_canceled; ++j)
+        {
+            EvaluatePair(live[i],
+                         live[j],
+                         limit);
+        }
+    }
+    ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
+                   100,
+                   "Finished cost matrix");
+
+    const uint32_t startCount = uint32_t(m_liveHullCount);
+    std::vector<ConvexHull*> partners;
+    while ( !m_hullPairQueue.empty() && !m_canceled )
+    {
+        if ( limit == MergeLimit::Budget && m_liveHullCount <= m_params.m_maxConvexHulls )
+        {
+            break;
+        }
+        const double merged = double(startCount - uint32_t(m_liveHullCount));
+        if ( PollProgress(Stages::MERGING_CONVEX_HULLS, startCount > 1 ? merged * 100.0 / double(startCount - 1) : 100.0, "Merging Convex Hulls") )
+        {
+            return;
+        }
+
+        const HullPair pair = m_hullPairQueue.top();
+        m_hullPairQueue.pop();
+
+        // A pair is stale once a cheaper merge has consumed either of its hulls.
+        ConvexHull* const first = GetHull(pair.m_hullA);
+        ConvexHull* const second = GetHull(pair.m_hullB);
+        if ( first == nullptr || second == nullptr )
+        {
+            continue;
+        }
+
+        std::unique_ptr<ConvexHull> combined = ComputeCombinedConvexHull(*first,
+                                                                        *second);
+        RemoveHull(pair.m_hullA);
+        RemoveHull(pair.m_hullB);
+        // Pairs pushed below carry the combined hull's id, which AddHull assigns as the current table size.
+        combined->m_meshId = uint32_t(m_hulls.size());
+        ConvexHull* const hull = combined.get();
+
+        // The partners of the new hull are the hulls that survive beside it, gathered before it joins them.
+        partners.clear();
+        partners.reserve(m_liveHullCount);
+        for (const std::unique_ptr<ConvexHull>& secondHull : m_hulls)
+        {
+            if ( secondHull )
+            {
+                partners.push_back(secondHull.get());
+            }
+        }
+        // AddHull sorts the combined hull's points, which pricing a pair against it needs.
+        AddHull(std::move(combined));
+        for (ConvexHull* const partner : partners)
+        {
+            if ( m_canceled )
+            {
+                break;
+            }
+            EvaluatePair(hull,
+                         partner,
+                         limit);
         }
     }
 }
@@ -5967,7 +6752,8 @@ void VHACDImpl::PerformMergeCostTask(CostTask& mt)
     double volume2 = ch2->m_volume;
 
     double combinedVolume = ComputeCombinedConvexHullVolume(*ch1,
-                                                            *ch2);
+                                                            *ch2,
+                                                            &mt.m_reachesTooFar);
     mt.m_concavity = ComputeConcavity(volume1 + volume2,
                                       combinedVolume,
                                       m_overallHullVolume);
@@ -6021,7 +6807,8 @@ std::vector<VHACD::Vertex> VHACDImpl::MergeHullPoints(const ConvexHull& sm1,
 }
 
 double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
-                                                  const ConvexHull& sm2)
+                                                  const ConvexHull& sm2,
+                                                  bool* const reachesTooFar)
 {
     const std::vector<VHACD::Vertex> vertices = MergeHullPoints(sm1,
                                                                 sm2);
@@ -6029,6 +6816,12 @@ double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
                                  vertices,
                                  double(0.0001),
                                  int(vertices.size()));
+
+    if ( reachesTooFar )
+    {
+        *reachesTooFar = m_space.HullReachesTooFar(hull.GetVertexPool(),
+                                                   hull.GetFaces());
+    }
 
     // ComputeConvexHullVolume over the points and faces QuickHull would copy out, in the same order.
     const std::vector<VHACD::Vect3>& points = hull.GetVertexPool();
@@ -6050,30 +6843,45 @@ double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
     return totalVolume / double(6.0);
 }
 
+std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::SimplifyHull(const ConvexHull& source)
+{
+    if ( source.m_points.size() < 4 )
+    {
+        return std::unique_ptr<ConvexHull>(new ConvexHull(source));
+    }
+    // The builder takes its tolerance as a fraction of the cloud's diagonal, and the hull it leaves is
+    // inside the one it was given, so a hull never reaches farther for having been simplified.
+    const VHACD::BoundsAABB bounds(source.m_points);
+    const double diagonal = (bounds.GetMax() - bounds.GetMin()).GetNorm();
+    const double relative = diagonal > double(0.0) ? (m_tolerance * kSimplifyFraction) / diagonal : double(0.0001);
+
+    VHACD::QuickHull qh;
+    if ( qh.ComputeConvexHull(m_hullWorkspace,
+                              source.m_points,
+                              m_params.m_maxNumVerticesPerCH,
+                              std::max(relative, double(0.0001))) == 0 )
+    {
+        return std::unique_ptr<ConvexHull>(new ConvexHull(source));
+    }
+
+    std::unique_ptr<ConvexHull> ret(new ConvexHull);
+    ret->m_points = qh.GetVertices();
+    ret->m_triangles = qh.GetIndices();
+    ret->m_volume = ComputeConvexHullVolume(*ret);
+    const VHACD::BoundsAABB b = VHACD::BoundsAABB(ret->m_points).Inflate(double(0.1));
+    ret->mBmin = b.GetMin();
+    ret->mBmax = b.GetMax();
+    return ret;
+}
+
 std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::ComputeCombinedConvexHull(const ConvexHull& sm1,
                                                                          const ConvexHull& sm2)
 {
     std::vector<VHACD::Vertex> vertices = MergeHullPoints(sm1,
                                                           sm2);
-    uint32_t vcount = uint32_t(vertices.size()); // Total vertices from both hulls
-
-    VHACD::QuickHull qh;
-    qh.ComputeConvexHull(m_hullWorkspace,
-                         vertices,
-                         vcount);
-
-    std::unique_ptr<ConvexHull> ret(new ConvexHull);
-    ret->m_points = qh.GetVertices();
-    ret->m_triangles = qh.GetIndices();
-
-    ret->m_volume = ComputeConvexHullVolume(*ret);
-
-    VHACD::BoundsAABB b = VHACD::BoundsAABB(qh.GetVertices()).Inflate(double(0.1));
-    ret->mBmin = b.GetMin();
-    ret->mBmax = b.GetMax();
-
-    // Return the convex hull
-    return ret;
+    ConvexHull combined;
+    combined.m_points = std::move(vertices);
+    return SimplifyHull(combined);
 }
 
 IVHACD::ConvexHull* VHACDImpl::GetHull(uint32_t id)
@@ -6084,6 +6892,14 @@ IVHACD::ConvexHull* VHACDImpl::GetHull(uint32_t id)
 IVHACD::ConvexHull* VHACDImpl::AddHull(std::unique_ptr<ConvexHull> hull)
 {
     hull->m_meshId = uint32_t(m_hulls.size());
+    // Until ScaleOutputConvexHull replaces it with the centre of mass, m_center holds the average of the
+    // hull's points, which lies inside the hull and is what the merge phase tests segments between.
+    VHACD::Vect3 centroid(0, 0, 0);
+    for (const VHACD::Vertex& point : hull->m_points)
+    {
+        centroid += VHACD::Vect3(point);
+    }
+    hull->m_center = hull->m_points.empty() ? centroid : centroid / double(hull->m_points.size());
     std::vector<VHACD::Vertex> sorted = hull->m_points;
     std::sort(sorted.begin(),
               sorted.end(),
