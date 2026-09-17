@@ -198,3 +198,10 @@ build/
 /decomp.stl
 /decomp.usda
 /*_decompose.stl
+
+# Visual Studio project files CMake generates beside the sources.
+/app/*.vcxproj
+/app/*.vcxproj.filters
+/app/*.vcxproj.user
+/app/*.sln
+/app/TestVHACD.exe

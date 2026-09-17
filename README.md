@@ -125,10 +125,15 @@ without building anything; without those three tests a passenger coach takes 17.
   cross-multiplication, so the field is exact and reproduces bit for bit.
 - Latent undefined behavior is fixed: out-of-range pointer arithmetic in the flood fill, a tree of unbounded depth
   walked with a fixed-size stack, a data race on a static counter shared by all instances, and a quicksort whose
-  stack was guarded only by an assert.
+  stack was guarded only by an assert. A later audit found more of its own: a mesh with no extent converting NaN
+  to an unsigned integer, a grid able to exceed the ten bits a voxel coordinate has, and a distance transform
+  writing to an empty buffer.
+- The whole corpus decomposes identically whether assertions and the standard library's hardening are on or off,
+  and no assertion fires on any of its 611 models.
 - `ConvexHull::m_center` is the hull's center of mass as a solid.
 - A contract test suite (`test/ContractTests.cpp`) covers typed results, validation, cancellation, instance reuse,
-  centroids, hull reduction, what the tolerance, probe radius and budgets promise, the orientation test against
+  centroids, hull reduction, what the tolerance, probe radius and budgets promise, a rod too thin for the hull
+  builder keeping its collision, a mesh with no extent, settings no grid can satisfy, the orientation test against
   exact integer arithmetic, and the space test against its own definition over every voxel of a grid.
 
 ### Built for engines
@@ -137,7 +142,7 @@ without building anything; without those three tests a passenger coach takes 17.
   the CPU. Instances share no mutable state; run one per worker.
 - `Cancel()` works from any thread, including from your progress callback, and takes effect promptly: `Compute`
   reports progress after at most 10 ms of work plus its longest indivisible step. Over the benchmark corpus the
-  longest gap between reports is 14 ms for the median model and 16 ms at the 95th percentile; the worst, 152 ms,
+  longest gap between reports is 14 ms for the median model and 17 ms at the 95th percentile; the worst, 129 ms,
   is the 267,000-triangle warehouse, whose AABB tree is built in one step.
 
 ## Quick start
