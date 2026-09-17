@@ -386,6 +386,95 @@ void HullSpaceTestMatchesBruteForce()
     CHECK(agreements > 10);
 }
 
+// The hull builder refuses a point cloud whose thinnest extent is a small enough fraction of its longest,
+// whatever the voxels say, and a rod 500 m long and 1 mm thick is such a cloud. Its collision must not
+// disappear for it.
+void ThinRodKeepsItsCollision(IVHACD& v)
+{
+    for (const double thickness : {0.001, 0.01, 0.1})
+    {
+        Mesh rod = Box(500.0, thickness, thickness);
+        IVHACD::Parameters p = DefaultParams();
+        p.m_maxConvexHulls = 32;
+        p.m_minTolerance = 0.01;
+        p.m_maxTolerance = 0.03;
+        p.m_probeRadius = 0.05;
+        CHECK(Run(v, rod, p) == Result::Completed);
+        CHECK(v.GetNConvexHulls() >= 1);
+
+        // The rod's midpoint has to lie inside one of the hulls.
+        const double centre[3] = {250.0, 0.5 * thickness, 0.5 * thickness};
+        bool enclosed = false;
+        for (uint32_t i = 0; i < v.GetNConvexHulls(); ++i)
+        {
+            IVHACD::ConvexHull hull;
+            v.GetConvexHull(i, hull);
+            CHECK(hull.m_points.size() >= 4 && !hull.m_triangles.empty());
+            double worst = -std::numeric_limits<double>::max();
+            for (const VHACD::Triangle& t : hull.m_triangles)
+            {
+                const VHACD::Vect3 a(hull.m_points[t.mI0]);
+                const VHACD::Vect3 b(hull.m_points[t.mI1]);
+                const VHACD::Vect3 c(hull.m_points[t.mI2]);
+                VHACD::Vect3 normal = (b - a).Cross(c - a);
+                const double length = normal.GetNorm();
+                if (length > 1.0e-12)
+                {
+                    normal = normal / length;
+                    worst = std::max(worst, normal.Dot(VHACD::Vect3(centre[0], centre[1], centre[2]) - a));
+                }
+            }
+            enclosed = enclosed || worst <= 1.0e-9;
+        }
+        CHECK(enclosed);
+    }
+}
+
+// A mesh whose vertices all sit at one point describes no volume and no grid; it must come back empty
+// rather than with a report full of arithmetic that has no meaning.
+void MeshWithoutExtentIsHandled(IVHACD& v)
+{
+    Mesh point = Box(0.0, 0.0, 0.0);
+    CHECK(Run(v, point, DefaultParams()) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 0);
+    CHECK(v.GetReport().m_voxelCount == 0);
+    CHECK(std::isfinite(v.GetReport().m_tolerance) && std::isfinite(v.GetReport().m_voxelSize));
+}
+
+// Voxel coordinates are packed into ten bits each, so no grid may exceed 1021 voxels on an axis whatever
+// is asked of it, and no setting may leave a model without collision.
+void ExtremeSettingsStillProduceAGrid(IVHACD& v)
+{
+    struct Case
+    {
+        double m_extent;
+        double m_tolerance;
+        double m_probe;
+        uint32_t m_maxVoxels;
+    };
+    const Case cases[] = {
+        {500.0, 1.0e-6, 1.0e-6, 4096},        // finer than any budget can hold
+        {500.0, 1.0e-6, 1.0e-6, 8u << 20},    // and with a budget that cannot help either
+        {1.0, 0.01, 1000.0, 512u * 1024u},    // a probe a thousand times the model
+        {0.001, 0.01, 0.05, 512u * 1024u},    // a model far below its own tolerance
+    };
+    for (const Case& c : cases)
+    {
+        IVHACD::Parameters p = DefaultParams();
+        p.m_maxConvexHulls = 32;
+        p.m_relativeTolerance = 0.01;
+        p.m_minTolerance = c.m_tolerance;
+        p.m_maxTolerance = std::max(c.m_tolerance, 0.03);
+        p.m_probeRadius = c.m_probe;
+        p.m_maxVoxels = c.m_maxVoxels;
+        CHECK(Run(v, Box(c.m_extent, c.m_extent, c.m_extent), p) == Result::Completed);
+        CHECK(v.GetNConvexHulls() >= 1);
+        const IVHACD::Report& report = v.GetReport();
+        CHECK(report.m_voxelCount > 0 && report.m_voxelCount <= std::max(c.m_maxVoxels, 4096u));
+        CHECK(report.m_voxelSize > 0 && std::isfinite(report.m_tolerance));
+    }
+}
+
 void EmptyMeshCompletesWithoutHulls(IVHACD& v)
 {
     CHECK(v.Compute(static_cast<const double*>(nullptr), 0, nullptr, 0, DefaultParams()) == Result::Completed);
@@ -801,6 +890,9 @@ int main()
     InvalidParametersAreRejected(*v);
     EmptyMeshCompletesWithoutHulls(*v);
     EveryPieceHasVolume(*v);
+    ThinRodKeepsItsCollision(*v);
+    MeshWithoutExtentIsHandled(*v);
+    ExtremeSettingsStillProduceAGrid(*v);
     CancelFromUpdateStopsAndReleasesResults(*v);
     ReusedInstanceReproducesResults(*v);
     CenterIsTheSolidCentroid(*v);

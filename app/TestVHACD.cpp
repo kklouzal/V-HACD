@@ -153,7 +153,7 @@ int main(int argc,const char **argv)
 		printf("-n <minTolerance>       : Smallest tolerance in model units. Default is 0.01\n");
 		printf("-x <maxTolerance>       : Largest tolerance in model units. Default is 0.03\n");
 		printf("-t <probeRadius>        : Gaps and pockets a sphere of this radius cannot enter are filled. Default is 0.05\n");
-		printf("-r <maxVoxels>          : Voxel budget; a coarser grid, and tolerance, is used when it binds. Default is 8,388,608\n");
+		printf("-r <maxVoxels>          : Voxel budget; a coarser grid, and tolerance, is used when it binds. Default is 524,288\n");
 		printf("-d <maxPieces>          : Piece budget: splitting stops here even where a piece reaches too far. Default is 512\n");
 		printf("-s <true/false>         : Whether or not to shrinkwrap output to source mesh. Default is true.\n");
 		printf("-f <fillMode>           : Fill mode. Default is 'flood', also 'surface' and 'raycast' are valid.\n");

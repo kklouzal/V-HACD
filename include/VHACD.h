@@ -4487,6 +4487,10 @@ inline void DistanceLinePass(const std::vector<int32_t>& in,
                              std::vector<int32_t>& boundary)
 {
     const int32_t count = int32_t(in.size());
+    if (count == 0)
+    {
+        return;
+    }
     auto value = [&in](const int64_t x, const int32_t i)
     {
         const int64_t delta = x - i;
@@ -4543,6 +4547,10 @@ void SquaredDistanceTransform(const VHACD::Vector3<uint32_t>& dim,
     const size_t dimY = dim[1];
     const size_t dimZ = dim[2];
     distances.assign(dimX * dimY * dimZ, 0);
+    if (distances.empty())
+    {
+        return;
+    }
 
     // Pass 1: distance along z inside each (i, j) column, still unsquared.
     for (size_t i = 0; i < dimX; ++i)
@@ -4630,6 +4638,9 @@ constexpr double kVoxelsPerToleranceOpen = 3.0;
 // recognizable shape.
 constexpr uint32_t kMinVoxelsPerModel = 16;
 
+// Below this a grid cannot hold a mesh and the space around it at any useful tolerance.
+constexpr uint32_t MinVoxelBudget = 4096;
+
 // The voxel size for a tolerance, coarsened until the padded grid fits the voxel budget and the voxels
 // per axis the Voxel packing allows. Extents are in the same units as the tolerance.
 struct GridSizing
@@ -4640,47 +4651,80 @@ struct GridSizing
     bool        m_budgetBound{ false };
 };
 
+// Voxels along an axis for a voxel size: the mesh, plus the padding the probe needs on both sides.
+inline double GridSideFor(const double extent,
+                          const double voxelSize,
+                          const uint32_t pad)
+{
+    return std::floor(extent / voxelSize) + 1 + 2 * double(pad);
+}
+
+inline uint32_t GridPadFor(const double probeRadius,
+                           const double voxelSize)
+{
+    // The probe needs its radius of empty space, plus a voxel for the far test and one to keep the mesh
+    // off the boundary.
+    return uint32_t(std::ceil(probeRadius / voxelSize)) + 2;
+}
+
 inline GridSizing ChooseGrid(const VHACD::Vect3& extent,
                              const double tolerance,
                              const double probeRadius,
                              const uint32_t maxVoxels)
 {
-    const double longest = std::max({ extent[0], extent[1], extent[2], std::numeric_limits<double>::min() });
+    const double longest = std::max({ extent[0], extent[1], extent[2] });
+    // Callers voxelize nothing without extent, and validation rejects a tolerance that is not positive.
+    assert(longest > double(0.0) && tolerance > double(0.0) && maxVoxels >= MinVoxelBudget);
+
     GridSizing sizing;
     sizing.m_voxelSize = std::min(tolerance / kVoxelsPerToleranceClosed, longest / double(kMinVoxelsPerModel));
-    sizing.m_voxelsPerTolerance = kVoxelsPerToleranceClosed;
     if (probeRadius < 2 * sizing.m_voxelSize)
     {
         sizing.m_voxelSize = std::min(tolerance / kVoxelsPerToleranceOpen, longest / double(kMinVoxelsPerModel));
-        sizing.m_voxelsPerTolerance = kVoxelsPerToleranceOpen;
     }
+
+    // Voxel coordinates are packed into ten bits each, so no axis may exceed MaxVoxelDimension. Since
+    // floor(e / h) + 1 + 2 * (ceil(r / h) + 2) is at most (e + 2r) / h + 7, this size settles it outright,
+    // and every step below only coarsens the grid further.
+    const double axisFloor = (longest + 2 * probeRadius) / double(MaxVoxelDimension - 7);
+    if (sizing.m_voxelSize < axisFloor)
+    {
+        sizing.m_voxelSize = axisFloor;
+        sizing.m_budgetBound = true;
+    }
+
+    // Coarsen until the grid fits the voxel budget. A voxel the size of the model leaves five voxels per
+    // axis whatever the padding, which is far inside the smallest budget the contract allows, so this
+    // always ends.
     for (uint32_t attempt = 0; attempt < 64; ++attempt)
     {
-        // The probe needs its radius of empty space, plus a voxel for the far test and one to keep the
-        // mesh off the boundary.
-        sizing.m_pad = uint32_t(std::ceil(probeRadius / sizing.m_voxelSize)) + 2;
+        sizing.m_pad = GridPadFor(probeRadius, sizing.m_voxelSize);
         double count = 1;
-        double widest = 0;
         for (int32_t axis = 0; axis < 3; ++axis)
         {
-            const double side = std::floor(extent[axis] / sizing.m_voxelSize) + 1 + 2 * double(sizing.m_pad);
-            count *= side;
-            widest = std::max(widest, side);
+            count *= GridSideFor(extent[axis], sizing.m_voxelSize, sizing.m_pad);
         }
-        if (count <= double(maxVoxels) && widest <= double(MaxVoxelDimension))
+        if (count <= double(maxVoxels))
         {
-            return sizing;
+            break;
         }
         sizing.m_budgetBound = true;
-        // A coarser grid may no longer resolve the probe, and then the margin has to do the work again.
-        if (probeRadius < 2 * sizing.m_voxelSize)
+        sizing.m_voxelSize *= std::max(std::cbrt(count / double(maxVoxels)), double(1.02));
+        if (attempt + 1 == 64)
         {
-            sizing.m_voxelsPerTolerance = kVoxelsPerToleranceOpen;
+            // Unreachable while the multiplier above holds, and cheap insurance if it ever does not.
+            sizing.m_voxelSize = longest;
+            sizing.m_pad = GridPadFor(probeRadius, sizing.m_voxelSize);
         }
-        sizing.m_voxelSize *= std::max({ std::cbrt(count / double(maxVoxels)),
-                                         widest / double(MaxVoxelDimension),
-                                         double(1.02) });
     }
+
+    // The margin the far test needs depends on whether the grid that was finally chosen resolves the
+    // probe, not on the one first asked for.
+    sizing.m_voxelsPerTolerance = probeRadius >= 2 * sizing.m_voxelSize ? kVoxelsPerToleranceClosed
+                                                                       : kVoxelsPerToleranceOpen;
+    assert(GridSideFor(extent[0], sizing.m_voxelSize, sizing.m_pad) <= double(MaxVoxelDimension)
+           && GridSideFor(extent[1], sizing.m_voxelSize, sizing.m_pad) <= double(MaxVoxelDimension)
+           && GridSideFor(extent[2], sizing.m_voxelSize, sizing.m_pad) <= double(MaxVoxelDimension));
     return sizing;
 }
 
@@ -5205,6 +5249,37 @@ bool SpaceModel::ReachesTooFar(const std::vector<VHACD::Vect3>& local,
     return ScanRectangle(x0, y0, x1, y1, planes);
 }
 
+// The box around a set of points, as a hull. The convex hull builder refuses a point cloud whose
+// thinnest extent is a small enough fraction of its longest, however many voxels that cloud spans, and a
+// piece is never nothing: it holds voxels, and the box holds them all, no farther out than its own hull
+// would reach along the axes.
+inline std::unique_ptr<IVHACD::ConvexHull> BoxHullOfPoints(const std::vector<VHACD::Vertex>& points)
+{
+    if (points.empty())
+    {
+        return nullptr;
+    }
+    const VHACD::BoundsAABB bounds(points);
+    const VHACD::Vect3 low = bounds.GetMin();
+    const VHACD::Vect3 high = bounds.GetMax();
+
+    std::unique_ptr<IVHACD::ConvexHull> hull(new IVHACD::ConvexHull);
+    hull->m_points.reserve(8);
+    for (uint32_t corner = 0; corner < 8; ++corner)
+    {
+        hull->m_points.emplace_back((corner & 1) ? high.GetX() : low.GetX(),
+                                    (corner & 2) ? high.GetY() : low.GetY(),
+                                    (corner & 4) ? high.GetZ() : low.GetZ());
+    }
+    // Outward winding, as the hull builder produces.
+    hull->m_triangles = { { 0, 2, 1 }, { 1, 2, 3 }, { 4, 5, 6 }, { 5, 7, 6 },
+                          { 0, 1, 4 }, { 1, 5, 4 }, { 2, 6, 3 }, { 3, 6, 7 },
+                          { 0, 4, 2 }, { 2, 4, 6 }, { 1, 3, 5 }, { 3, 7, 5 } };
+    hull->m_volume = VHACD::ComputeMeshVolume(hull->m_points,
+                                              hull->m_triangles);
+    return hull;
+}
+
 //***********************************************************************************************
 // QuickHull implementation
 //***********************************************************************************************
@@ -5283,22 +5358,25 @@ void ShrinkWrap(ConvexHullWorkspace& workspace,
                 double distanceThreshold,
                 bool doShrinkWrap)
 {
+    // The projected points are kept apart from the hull until the rebuild succeeds: moving its vertices in
+    // place would leave them paired with faces that no longer describe them if the rebuild then failed.
     std::vector<VHACD::Vertex> verts; // New verts for the new convex hull
     verts.reserve(sourceConvexHull.m_vertices.size());
     // Examine each vertex and see if it is within the voxel distance.
     // If it is, then replace the point with the shrinkwrapped / projected point
     for (uint32_t j = 0; j < sourceConvexHull.m_vertices.size(); j++)
     {
-        VHACD::Vertex& p = sourceConvexHull.m_vertices[j];
+        const VHACD::Vertex& p = sourceConvexHull.m_vertices[j];
+        VHACD::Vect3 projected(p);
         if (doShrinkWrap)
         {
             VHACD::Vect3 closest;
             if (aabbTree.GetClosestPointWithinDistance(p, distanceThreshold, closest))
             {
-                p = closest;
+                projected = closest;
             }
         }
-        verts.emplace_back(p);
+        verts.emplace_back(projected);
     }
     // Final step is to recompute the convex hull
     VHACD::QuickHull qh;
@@ -5326,8 +5404,6 @@ enum class SplitAxis
 // It bounds the recursion should a piece ever fail to shrink.
 constexpr uint32_t MaxSplitDepth = 64;
 
-// Below this a grid cannot hold a mesh and the space around it at any useful tolerance.
-constexpr uint32_t MinVoxelBudget = 4096;
 
 // How much of the tolerance the merge phase spends on simplifying its hulls. The output is reduced to the
 // vertex cap regardless, and merging prices every candidate pair, so hulls that carry a vertex per step of
@@ -5357,8 +5433,7 @@ public:
     // of which must outlive them.
     VoxelHull(Volume& voxels,
               ConvexHullWorkspace& hullWorkspace,
-              const SpaceModel& space,
-              const IVHACD::Parameters &params);
+              const SpaceModel& space);
 
     ~VoxelHull() = default;
 
@@ -5417,7 +5492,6 @@ public:
     VHACD::Vector3<uint32_t>                    m_2{ 0 };
 
     std::vector<VHACD::Vertex>                  m_vertices;
-    IVHACD::Parameters                          m_params;
 };
 
 VoxelHull::VoxelHull(const VoxelHull& parent,
@@ -5434,7 +5508,6 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
     , m_depth(parent.m_depth + 1)
     , m_1(parent.m_1)
     , m_2(parent.m_2)
-    , m_params(parent.m_params)
 {
     // Default copy the voxel region from the parent, but values will
     // be adjusted next based on the split axis and location
@@ -5560,8 +5633,7 @@ VoxelHull::VoxelHull(const VoxelHull& parent,
 
 VoxelHull::VoxelHull(Volume& voxels,
                      ConvexHullWorkspace& hullWorkspace,
-                     const SpaceModel& space,
-                     const IVHACD::Parameters& params)
+                     const SpaceModel& space)
     : m_voxels(&voxels)
     , m_hullWorkspace(&hullWorkspace)
     , m_space(&space)
@@ -5574,7 +5646,6 @@ VoxelHull::VoxelHull(Volume& voxels,
     // Now we get a copy of all voxels which are considered part of the 'interior' of the source mesh
     , m_interiorVoxels(m_voxels->GetInteriorVoxels())
     , m_2(m_voxels->GetDimensions() - 1)
-    , m_params(params)
 {
     CollectHullPoints();
     ComputeConvexHull();
@@ -5605,6 +5676,13 @@ void VoxelHull::ComputeConvexHull()
 
             m_convexHull->m_volume = VHACD::ComputeMeshVolume(m_convexHull->m_points,
                                                               m_convexHull->m_triangles);
+        }
+        else
+        {
+            // The builder calls a cloud too thin for its length degenerate and returns nothing. The piece
+            // still holds voxels, and dropping it would drop their surface with it, so it takes the box
+            // around them; the far test then judges that box like any other hull.
+            m_convexHull = BoxHullOfPoints(m_vertices);
         }
     }
     // Whether this hull covers space it may not: farther than the tolerance from anything the probe
@@ -6339,6 +6417,16 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                        100,
                        "RaycastMesh completed");
     }
+    // A mesh whose vertices all sit at one point has nothing to voxelize, and no grid describes it.
+    if ( !m_canceled && !(m_scale > double(0.0)) )
+    {
+        if ( m_params.m_logger )
+        {
+            m_params.m_logger->Log("VHACD input has no extent; no hulls were produced");
+        }
+        return;
+    }
+
     if ( !m_canceled )
     {
         ProgressUpdate(Stages::VOXELIZING_INPUT_MESH,
@@ -6399,8 +6487,7 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                         "Build initial ConvexHull");
         std::unique_ptr<VoxelHull> vh = std::unique_ptr<VoxelHull>(new VoxelHull(m_voxelize,
                                                                                  m_hullWorkspace,
-                                                                                 m_space,
-                                                                                 m_params));
+                                                                                 m_space));
         if ( vh->m_convexHull )
         {
             m_overallHullVolume = vh->m_convexHull->m_volume;
@@ -6864,7 +6951,10 @@ double VHACDImpl::ComputeCombinedConvexHullVolume(const ConvexHull& sm1,
 
     if ( reachesTooFar )
     {
-        *reachesTooFar = m_space.HullReachesTooFar(hull.GetVertexPool(),
+        // A cloud too thin for its length leaves the builder with nothing, and a merge whose shape cannot
+        // be built cannot be tested against the space either; refusing it leaves both hulls as they are.
+        *reachesTooFar = hull.GetFaces().empty()
+                      || m_space.HullReachesTooFar(hull.GetVertexPool(),
                                                    hull.GetFaces());
     }
 
@@ -6892,7 +6982,8 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::SimplifyHull(const ConvexHull& so
 {
     if ( source.m_points.size() < 4 )
     {
-        return std::unique_ptr<ConvexHull>(new ConvexHull(source));
+        return source.m_triangles.empty() ? BoxHullOfPoints(source.m_points)
+                                          : std::unique_ptr<ConvexHull>(new ConvexHull(source));
     }
     // The builder takes its tolerance as a fraction of the cloud's diagonal, and the hull it leaves is
     // inside the one it was given, so a hull never reaches farther for having been simplified.
@@ -6906,7 +6997,17 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::SimplifyHull(const ConvexHull& so
                               m_params.m_maxNumVerticesPerCH,
                               std::clamp(relative, double(0.0001), kSimplifyHullFraction)) == 0 )
     {
-        return std::unique_ptr<ConvexHull>(new ConvexHull(source));
+        // Merge candidates arrive as points alone, so a refused cloud has no hull to fall back on.
+        std::unique_ptr<ConvexHull> box = source.m_triangles.empty()
+                                              ? BoxHullOfPoints(source.m_points)
+                                              : std::unique_ptr<ConvexHull>(new ConvexHull(source));
+        if ( box )
+        {
+            const VHACD::BoundsAABB b = VHACD::BoundsAABB(box->m_points).Inflate(double(0.1));
+            box->mBmin = b.GetMin();
+            box->mBmax = b.GetMax();
+        }
+        return box;
     }
 
     std::unique_ptr<ConvexHull> ret(new ConvexHull);
