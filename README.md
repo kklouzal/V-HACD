@@ -10,7 +10,7 @@ collision. One header, C++17, no dependencies.
 This is a maintained fork of [kmammou/v-hacd](https://github.com/kmammou/v-hacd) 4.1, which is archived. It keeps
 the algorithm but not its central assumption: you no longer ask for a number of hulls. You ask for an accuracy,
 and the hull count follows from the shape. On a corpus of 611 game models that is **half as many hulls** as
-upstream, **less than a quarter as much uncovered surface**, and **6x faster**.
+upstream, **less than a quarter as much uncovered surface**, and **5x faster**.
 
 ![Approximate convex decomposition of a camel](doc/acd.png)
 
@@ -22,23 +22,23 @@ diagonal, between 1 and 3 cm, with a 5 cm probe), on the same 611 inputs, one th
 
 |                                                        | Upstream 4.1 | This fork    |
 | ------------------------------------------------------ | -----------: | -----------: |
-| Hulls per model                                        | 30.1         | **14.5**     |
-| Hull faces per model                                   | 789          | **307**      |
+| Hulls per model                                        | 30.1         | **14.2**     |
+| Hull faces per model                                   | 789          | **304**      |
 | Models that came out as one hull                       | 10           | **81**       |
-| Models that hit the 32-hull cap                        | 550          | **116**      |
-| Source surface more than 1 cm outside every hull       | 3.37%        | **0.77%**    |
-| Source surface more than 5 cm outside every hull       | 2.24%        | **0.36%**    |
+| Models that hit the 32-hull cap                        | 550          | **113**      |
+| Source surface more than 1 cm outside every hull       | 3.37%        | **0.71%**    |
+| Source surface more than 5 cm outside every hull       | 2.24%        | **0.33%**    |
 | Hull surface standing off the source, 95th percentile  | 2.99 m       | **1.69 m**   |
 | Models decomposed into no hulls at all                 | 3            | **0**        |
-| Total decomposition time                               | 203 s        | **34 s**     |
-| Median model                                           | 195 ms       | **42 ms**    |
-| 95th percentile model                                  | 815 ms       | **163 ms**   |
-| Slowest model                                          | 4.26 s       | **250 ms**   |
+| Total decomposition time                               | 203 s        | **41 s**     |
+| Median model                                           | 195 ms       | **46 ms**    |
+| 95th percentile model                                  | 815 ms       | **233 ms**   |
+| Slowest model                                          | 4.26 s       | **441 ms**   |
 
 Every model's uncovered surface stays inside the accuracy it was asked for, at the 99th percentile, on all 611.
 The corpus is mostly large environment geometry, which is why those distances are in metres; on 61 props (glTF
 sample assets and game props under 10 m) the same comparison against the fork's own previous, count-driven
-revision is 15.3 hulls per model instead of 26.4, with hull surfaces standing 92 mm off the source at the 95th
+revision is 14.8 hulls per model instead of 26.4, with hull surfaces standing 91 mm off the source at the 95th
 percentile instead of 152 mm.
 
 ## How it decides
@@ -82,7 +82,7 @@ The fork measures distance instead, on the voxel grid it already builds:
 ### Faster than upstream
 
 The speed came first, from work that left every output byte for byte identical, and holds up under the new
-decisions: 203 s to 34 s over the corpus, and no model slower than 250 ms.
+decisions: 203 s to 41 s over the corpus, and no model slower than 441 ms.
 
 | Change | Speed-up |
 | --- | ---: |
