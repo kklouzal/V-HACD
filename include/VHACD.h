@@ -355,6 +355,7 @@ public:
         uint32_t            m_maxConvexHulls{ 64 };         // The maximum number of convex hulls to produce; at least 1
         uint32_t            m_resolution{ 400000 };         // Voxel budget. The longest axis receives floor(1.5 * m_resolution^0.33) voxels (at least 32, at most 1021)
         double              m_minimumVolumePercentErrorAllowed{ 1 }; // A piece stops splitting once its hull volume is within this percentage of its voxel volume; finite and >= 0
+        double              m_tiltedSurfaceAllowance{ 0.5 }; // Voxel volumes of hull excess per tilted-surface voxel not counted as volume error; finite and >= 0 (see VoxelHull::ComputeConvexHull)
         uint32_t            m_maxRecursionDepth{ 10 };      // Pieces at this split depth are not split again (the root is depth 0), so at most 2^depth pieces precede merging
         bool                m_shrinkWrap{true};             // Whether or not to shrinkwrap the voxel positions to the source mesh on output
         FillMode            m_fillMode{ FillMode::FLOOD_FILL }; // How to fill the interior of the voxelized mesh
@@ -2624,9 +2625,9 @@ void ConvexHull::CalculateConvexHull3D(ConvexHullAABBTreeNode* vertexTree,
 //***********************************************************************************************
 
 /*
- * A wrapper class for 3 10 bit integers packed into a 32 bit integer
- * Layout is [PAD][X][Y][Z]
- * Pad is bits 31-30, X is 29-20, Y is 19-10, and Z is 9-0
+ * A wrapper class for 3 10 bit integers and a surface flag packed into a 32 bit integer
+ * Layout is [PAD][TILTED][X][Y][Z]
+ * Pad is bit 31, TILTED is bit 30, X is 29-20, Y is 19-10, and Z is 9-0
  */
 class Voxel
 {
@@ -2637,13 +2638,12 @@ class Voxel
     static constexpr int VoxelBitsYStart = 10;
     static constexpr int VoxelBitsXStart = 20;
     static constexpr int VoxelBitMask = 0x03FF; // bits 0 through 9 inclusive
+    static constexpr uint32_t TiltedSurfaceBit = uint32_t(1) << 30;
 public:
-
-
     Voxel(uint32_t x,
           uint32_t y,
-          uint32_t z);
-
+          uint32_t z,
+          bool onTiltedSurface = false);
 
     VHACD::Vector3<uint32_t> GetVoxel() const;
 
@@ -2651,6 +2651,8 @@ public:
     uint32_t GetY() const;
     uint32_t GetZ() const;
 
+    // True for a surface voxel produced by a triangle that is not axis aligned
+    bool IsOnTiltedSurface() const;
 
 private:
     uint32_t m_voxel{ 0 };
@@ -2658,8 +2660,10 @@ private:
 
 Voxel::Voxel(uint32_t x,
              uint32_t y,
-             uint32_t z)
-    : m_voxel((x << VoxelBitsXStart) | (y << VoxelBitsYStart) | (z << VoxelBitsZStart))
+             uint32_t z,
+             bool onTiltedSurface)
+    : m_voxel((x << VoxelBitsXStart) | (y << VoxelBitsYStart) | (z << VoxelBitsZStart) |
+              (onTiltedSurface ? TiltedSurfaceBit : 0))
 {
     assert(x < 1024 && "Voxel constructed with X outside of range");
     assert(y < 1024 && "Voxel constructed with Y outside of range");
@@ -2669,6 +2673,11 @@ Voxel::Voxel(uint32_t x,
 VHACD::Vector3<uint32_t> Voxel::GetVoxel() const
 {
     return VHACD::Vector3<uint32_t>(GetX(), GetY(), GetZ());
+}
+
+bool Voxel::IsOnTiltedSurface() const
+{
+    return (m_voxel & TiltedSurfaceBit) != 0;
 }
 
 uint32_t Voxel::GetX() const
@@ -3751,6 +3760,13 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                 k1 = std::max(k1, k);
             }
         }
+        // A triangle is tilted when its normal leaves an axis by more than about half a degree. Below
+        // that, a staircase step spans more than 100 voxels, longer than the pieces that measure it.
+        const VHACD::Vect3 normal = (p[1] - p[0]).Cross(p[2] - p[0]);
+        const double nx = std::abs(normal[0]);
+        const double ny = std::abs(normal[1]);
+        const double nz = std::abs(normal[2]);
+        const bool tilted = std::max({nx, ny, nz}) < 0.99 * (nx + ny + nz);
         if (i0 > 0)
             --i0;
         if (j0 > 0)
@@ -3786,7 +3802,8 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
                         value = VoxelValue::PRIMITIVE_ON_SURFACE;
                         m_surfaceVoxels.emplace_back(uint32_t(i_id),
                                                      uint32_t(j_id),
-                                                     uint32_t(k_id));
+                                                     uint32_t(k_id),
+                                                     tilted);
                     }
                 }
             }
@@ -4521,7 +4538,19 @@ void VoxelHull::ComputeConvexHull()
     double singleVoxelVolume = m_voxelScale * m_voxelScale * m_voxelScale;
     size_t voxelCount = m_interiorVoxels.size() + m_newSurfaceVoxels.size() + m_surfaceVoxels.size();
     m_voxelVolume = singleVoxelVolume * double(voxelCount);
-    double diff = fabs(m_hullVolume - m_voxelVolume);
+    // A hull of voxel corners exceeds the voxels of any tilted surface by a staircase gap even when the
+    // surface is flat: between two steps the hull runs over the step tips while the voxels stay one
+    // step lower, which averages half a voxel per voxel along a run. Axis-aligned surfaces and the
+    // split-plane faces in m_newSurfaceVoxels leave no gap. Without discounting that gap, a flat tilted
+    // face never reaches m_minimumVolumePercentErrorAllowed and every oblique solid, even a rotated cube,
+    // is split to m_maxRecursionDepth.
+    size_t tiltedSurfaceVoxels = 0;
+    for (const Voxel& v : m_surfaceVoxels)
+    {
+        tiltedSurfaceVoxels += v.IsOnTiltedSurface() ? 1 : 0;
+    }
+    const double allowance = m_params.m_tiltedSurfaceAllowance * singleVoxelVolume * double(tiltedSurfaceVoxels);
+    double diff = std::max(fabs(m_hullVolume - m_voxelVolume) - allowance, 0.0);
     m_volumeError = (diff * 100) / m_voxelVolume;
 }
 
@@ -4917,6 +4946,10 @@ const char* VHACDImpl::ValidateInput(const Coordinate* const points,
     if ( !std::isfinite(params.m_minimumVolumePercentErrorAllowed) || params.m_minimumVolumePercentErrorAllowed < 0 )
     {
         return "m_minimumVolumePercentErrorAllowed must be finite and non-negative";
+    }
+    if ( !std::isfinite(params.m_tiltedSurfaceAllowance) || params.m_tiltedSurfaceAllowance < 0 )
+    {
+        return "m_tiltedSurfaceAllowance must be finite and non-negative";
     }
     if ( VoxelDimensionForResolution(params.m_resolution) > MaxVoxelDimension )
     {

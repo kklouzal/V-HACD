@@ -175,6 +175,43 @@ void InvalidParametersAreRejected(IVHACD& v)
     p = DefaultParams();
     p.m_resolution = std::numeric_limits<uint32_t>::max();
     CHECK(Run(v, box, p) == Result::InvalidInput);
+
+    p = DefaultParams();
+    p.m_tiltedSurfaceAllowance = std::numeric_limits<double>::infinity();
+    CHECK(Run(v, box, p) == Result::InvalidInput);
+    p.m_tiltedSurfaceAllowance = -0.5;
+    CHECK(Run(v, box, p) == Result::InvalidInput);
+}
+
+// A unit cube rotated off every axis is convex, so it must remain one hull. Its voxelized faces are
+// staircases whose corner hull always exceeds the voxels; without the tilted-surface allowance that
+// gap reads as concavity and the cube splits down to the recursion limit.
+void RotatedCubeRemainsOneHull(IVHACD& v)
+{
+    const double a = 0.5;
+    const double c = std::cos(a);
+    const double s = std::sin(a);
+    Mesh cube = Box(1, 1, 1);
+    for (size_t i = 0; i < cube.points.size(); i += 3)
+    {
+        const double x = cube.points[i];
+        const double y = cube.points[i + 1];
+        const double z = cube.points[i + 2];
+        cube.points[i] = x * c - y * s;
+        cube.points[i + 1] = x * s * c + y * c * c - z * s;
+        cube.points[i + 2] = x * s * s + y * c * s + z * c;
+    }
+    IVHACD::Parameters p;
+    p.m_maxConvexHulls = 32;
+    p.m_resolution = 100000;
+    p.m_maxNumVerticesPerCH = 44;
+    p.m_maxRecursionDepth = 9;
+    CHECK(Run(v, cube, p) == Result::Completed);
+    CHECK(v.GetNConvexHulls() == 1);
+
+    p.m_tiltedSurfaceAllowance = 0;
+    CHECK(Run(v, cube, p) == Result::Completed);
+    CHECK(v.GetNConvexHulls() > 1);
 }
 
 void EmptyMeshCompletesWithoutHulls(IVHACD& v)
@@ -281,6 +318,7 @@ int main()
     CancelFromUpdateStopsAndReleasesResults(*v);
     ReusedInstanceReproducesResults(*v);
     CenterIsTheSolidCentroid(*v);
+    RotatedCubeRemainsOneHull(*v);
     v->Release();
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures, g_failures == 1 ? "" : "s");
