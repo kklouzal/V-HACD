@@ -5307,6 +5307,11 @@ constexpr uint32_t MinVoxelBudget = 4096;
 // and leaves that much of the surface uncovered.
 constexpr double kSimplifyFraction = 0.25;
 
+// And never more than this share of a hull's own diagonal. A piece can be far smaller than the tolerance,
+// as an 18 cm light is on a 270 m airfield, and simplifying such a piece by the model's tolerance would
+// collapse it inside the feature it stands for.
+constexpr double kSimplifyHullFraction = 0.05;
+
 // This class represents a collection of voxels, the convex hull
 // which surrounds them, and a triangle mesh representation of those voxels
 class VoxelHull
@@ -6870,7 +6875,7 @@ std::unique_ptr<IVHACD::ConvexHull> VHACDImpl::SimplifyHull(const ConvexHull& so
     if ( qh.ComputeConvexHull(m_hullWorkspace,
                               source.m_points,
                               m_params.m_maxNumVerticesPerCH,
-                              std::max(relative, double(0.0001))) == 0 )
+                              std::clamp(relative, double(0.0001), kSimplifyHullFraction)) == 0 )
     {
         return std::unique_ptr<ConvexHull>(new ConvexHull(source));
     }
