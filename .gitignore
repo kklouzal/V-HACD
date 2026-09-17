@@ -191,3 +191,10 @@ build/
 /app/x64/Debug/ZERO_CHECK
 /app/x64/Release/ZERO_CHECK
 /*.bak
+
+# TestVHACD writes its results into the working directory.
+/decomp.obj
+/decomp.mtl
+/decomp.stl
+/decomp.usda
+/*_decompose.stl
