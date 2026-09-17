@@ -811,6 +811,12 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 #include <intrin.h>
 #endif // _MSC_VER
 
+// The implementation uses SSE2, which every x86-64 CPU has.
+#if !(defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#error "The V-HACD implementation requires SSE2"
+#endif
+#include <emmintrin.h>
+
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable:4100 4127 4189 4244 4456 4701 4702 4996)
@@ -1896,7 +1902,8 @@ class ConvexHullAABBTreeNode
 {
     #define VHACD_CONVEXHULL_3D_VERTEX_CLUSTER_SIZE 8
 public:
-    ConvexHullAABBTreeNode() = default;
+    // m_count and m_indices are written before they are read, and only for leaves.
+    ConvexHullAABBTreeNode() {}
 
     VHACD::Vect3 m_box[2];
     ConvexHullAABBTreeNode* m_left{ nullptr };
@@ -2168,14 +2175,28 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
         ConvexHullAABBTreeNode& clump = memoryPool.emplace_back();
 
         clump.m_count = count;
+        // x and y share one SSE2 register; _mm_min_pd(value, bound) keeps the bound on ties, as std::min(bound,
+        // value) does, so the bounds are those CWiseMin and CWiseMax produced.
+        __m128d lowXY = _mm_set_pd(minP[1], minP[0]);
+        __m128d highXY = _mm_set_pd(maxP[1], maxP[0]);
+        double lowZ = minP[2];
+        double highZ = maxP[2];
         for (int i = 0; i < count; ++i)
         {
             clump.m_indices[i] = i + baseIndex;
 
             const VHACD::Vect3& p = points[i];
-            minP = minP.CWiseMin(p);
-            maxP = maxP.CWiseMax(p);
+            const __m128d xy = _mm_loadu_pd(&p[0]);
+            lowXY = _mm_min_pd(xy, lowXY);
+            highXY = _mm_max_pd(xy, highXY);
+            lowZ = std::min(lowZ, p[2]);
+            highZ = std::max(highZ, p[2]);
         }
+        double low[2], high[2];
+        _mm_storeu_pd(low, lowXY);
+        _mm_storeu_pd(high, highXY);
+        minP = VHACD::Vect3(low[0], low[1], lowZ);
+        maxP = VHACD::Vect3(high[0], high[1], highZ);
 
         clump.m_left = nullptr;
         clump.m_right = nullptr;
@@ -2183,22 +2204,40 @@ ConvexHullAABBTreeNode* ConvexHull::BuildTreeRecurse(ConvexHullAABBTreeNode* con
     }
     else
     {
-        // Per-axis scalars, summed in point order as the vector operations did.
+        // x and y run as the two lanes of SSE2 registers and z as scalars. Each axis still accumulates in point
+        // order, so the sums and bounds are bit identical to per-axis scalar code.
         double low[3] = { minP[0], minP[1], minP[2] };
         double high[3] = { maxP[0], maxP[1], maxP[2] };
         double sum[3] = { 0.0, 0.0, 0.0 };
         double sumSquares[3] = { 0.0, 0.0, 0.0 };
+        __m128d lowXY = _mm_loadu_pd(low);
+        __m128d highXY = _mm_loadu_pd(high);
+        __m128d sumXY = _mm_setzero_pd();
+        __m128d sumSquaresXY = _mm_setzero_pd();
         for (int i = 0; i < count; ++i)
         {
             const VHACD::Vect3& p = points[i];
-            for (int axis = 0; axis < 3; ++axis)
-            {
-                const double value = p[axis];
-                low[axis] = std::min(low[axis], value);
-                high[axis] = std::max(high[axis], value);
-                sum[axis] += value;
-                sumSquares[axis] += value * value;
-            }
+            const __m128d xy = _mm_loadu_pd(&p[0]);
+            lowXY = _mm_min_pd(xy, lowXY);
+            highXY = _mm_max_pd(xy, highXY);
+            sumXY = _mm_add_pd(sumXY, xy);
+            sumSquaresXY = _mm_add_pd(sumSquaresXY, _mm_mul_pd(xy, xy));
+            const double z = p[2];
+            low[2] = std::min(low[2], z);
+            high[2] = std::max(high[2], z);
+            sum[2] += z;
+            sumSquares[2] += z * z;
+        }
+        _mm_storeu_pd(low, lowXY);
+        _mm_storeu_pd(high, highXY);
+        {
+            double xySum[2], xySumSquares[2];
+            _mm_storeu_pd(xySum, sumXY);
+            _mm_storeu_pd(xySumSquares, sumSquaresXY);
+            sum[0] = xySum[0];
+            sum[1] = xySum[1];
+            sumSquares[0] = xySumSquares[0];
+            sumSquares[1] = xySumSquares[1];
         }
         minP = VHACD::Vect3(low[0], low[1], low[2]);
         maxP = VHACD::Vect3(high[0], high[1], high[2]);

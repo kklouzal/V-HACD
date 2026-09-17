@@ -15,9 +15,10 @@ kklouzal/V-HACD is a maintained fork of the archived [kmammou/v-hacd](https://gi
 - `m_maxRecursionDepth` is exact: pieces at that depth are not split again (upstream split one level
   deeper).
 - A hull reduced to `m_maxNumVerticesPerCH` keeps the vertices farthest out first.
-- About 7x faster than upstream on a 611-model game corpus, mostly by removing a voxel raycast mesh
+- About 12x faster than upstream on a 611-model game corpus, mostly by removing a voxel raycast mesh
   that nothing read.
 - Latent undefined behavior is fixed, and `test/ContractTests.cpp` covers the API contract.
+- The implementation requires SSE2 (any x86-64 CPU).
 
 The upstream README follows.
 
