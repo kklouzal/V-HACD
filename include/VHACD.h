@@ -4694,10 +4694,12 @@ inline GridSizing ChooseGrid(const VHACD::Vect3& extent,
 class SpaceModel
 {
 public:
-    // probeRadius and tolerance are in voxels.
+    // probeRadius and tolerance are in voxels. Returns early, leaving nothing protected, once callbacks
+    // report cancellation; Compute discards the decomposition in that case.
     void Build(const Volume& volume,
                double probeRadius,
-               double tolerance);
+               double tolerance,
+               VHACDCallbacks& callbacks);
 
     // True when a voxel centre inside the hull lies farther than the tolerance from the closed solid.
     bool HullReachesTooFar(const std::vector<VHACD::Vertex>& points,
@@ -4757,7 +4759,8 @@ private:
 
 void SpaceModel::Build(const Volume& volume,
                        const double probeRadius,
-                       const double tolerance)
+                       const double tolerance,
+                       VHACDCallbacks& callbacks)
 {
     m_dim = volume.GetDimensions();
     m_scale = volume.GetScale();
@@ -4775,6 +4778,12 @@ void SpaceModel::Build(const Volume& volume,
     m_runStart.assign(dimX * dimY + 1, 0);
     m_columnSum.assign((dimX + 1) * (dimY + 1), 0);
 
+    // Each pass below walks the whole grid, so each is a step a caller waiting to cancel has to sit out.
+    auto canceled = [&callbacks](const double progress)
+    {
+        return callbacks.PollProgress(Stages::VOXELIZING_INPUT_MESH, progress, "Measuring reachable space");
+    };
+
     // The solid: everything the voxelizer marked as surface or interior.
     for (size_t index = 0; index < voxelCount; ++index)
     {
@@ -4782,6 +4791,10 @@ void SpaceModel::Build(const Volume& volume,
         solid[index] = (value == VoxelValue::PRIMITIVE_ON_SURFACE || value == VoxelValue::PRIMITIVE_INSIDE_SURFACE) ? 1 : 0;
     }
     SquaredDistanceTransform(m_dim, solid, field);
+    if (canceled(20.0))
+    {
+        return;
+    }
 
     // Centres where a probe sphere fits clear of every solid voxel cube, flood filled from the padded grid
     // boundary: what the probe cannot reach from outside is filled. Centres sit a voxel apart, so a probe
@@ -4830,6 +4843,11 @@ void SpaceModel::Build(const Volume& volume,
         if (k + 1 < dimZ)   visit(index + 1);
     }
 
+    if (canceled(40.0))
+    {
+        return;
+    }
+
     // The closed solid is the solid itself plus everything the probe sphere does not cover from those
     // centres. The solid belongs to it whatever the probe covers: a ball that reaches a solid voxel's
     // centre from a centre exactly its radius away does not make that voxel free space.
@@ -4840,6 +4858,11 @@ void SpaceModel::Build(const Volume& volume,
         mask[index] = (solid[index] || field[index] > probeSquared) ? 1 : 0;
     }
 
+    if (canceled(60.0))
+    {
+        return;
+    }
+
     // Far voxels: farther than the tolerance from the closed solid. A hull face can pass between voxel
     // centres, so a voxel one step nearer than the tolerance is left alone; with a tolerance of at least
     // three voxels this also keeps the notches of a voxel staircase, at most sqrt(3) voxels from solid,
@@ -4847,6 +4870,11 @@ void SpaceModel::Build(const Volume& volume,
     SquaredDistanceTransform(m_dim, mask, field);
     const double reach = std::max(tolerance - double(1.0), double(0.0));
     const int32_t reachSquared = int32_t(std::min(std::floor(reach * reach), double(INT32_MAX)));
+
+    if (canceled(80.0))
+    {
+        return;
+    }
 
     m_runZ.clear();
     for (size_t i = 0; i < dimX; ++i)
@@ -6349,7 +6377,8 @@ void VHACDImpl::CopyInputMesh(const std::vector<VHACD::Vertex>& points,
                                                     sizing.m_voxelsPerTolerance);
             m_space.Build(m_voxelize,
                           probeVoxels,
-                          toleranceVoxels);
+                          toleranceVoxels,
+                          *this);
 
             const VHACD::Vector3<uint32_t> dim = m_voxelize.GetDimensions();
             m_tolerance = toleranceVoxels * sizing.m_voxelSize;

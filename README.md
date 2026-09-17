@@ -4,53 +4,86 @@
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-informational.svg)
 ![Header-only](https://img.shields.io/badge/header--only-yes-success.svg)
 
-**Voxelized Hierarchical Approximate Convex Decomposition**: turn any triangle mesh into a small set of convex
-hulls for physics collision. One header, C++17, no dependencies.
+**Voxelized Hierarchical Approximate Convex Decomposition**: turn any triangle mesh into convex hulls for physics
+collision. One header, C++17, no dependencies.
 
 This is a maintained fork of [kmammou/v-hacd](https://github.com/kmammou/v-hacd) 4.1, which is archived. It keeps
-the algorithm and the shape of the API. On a corpus of 611 game models it is **12.6x faster**, leaves **about half
-as much of the source surface uncovered**, decomposes the three models upstream returned nothing for, and fits
-into an engine's job system.
+the algorithm but not its central assumption: you no longer ask for a number of hulls. You ask for an accuracy,
+and the hull count follows from the shape. On a corpus of 611 game models that is **half as many hulls** as
+upstream, **less than a third as much uncovered surface**, and **5.1x faster**.
 
 ![Approximate convex decomposition of a camel](doc/acd.png)
 
 ## At a glance
 
-Upstream 4.1 and this fork on the same 611 inputs with the same settings: 32 hulls, 32 vertices per hull,
-resolution 100000, one thread. See [Benchmark details](#benchmark-details).
+Upstream 4.1 at its own settings (32 hulls, resolution 100000) and this fork at its defaults (1% of each model's
+diagonal, between 1 and 3 cm, with a 5 cm probe), on the same 611 inputs, one thread. See
+[Benchmark details](#benchmark-details).
 
-|                                                        | Upstream 4.1           | This fork           |
-| ------------------------------------------------------ | ---------------------: | ------------------: |
-| Total decomposition time                               | 191.3 s                | **15.2 s**          |
-| Median model                                           | 194 ms                 | **11.3 ms**         |
-| 95th percentile model                                  | 805 ms                 | **81 ms**           |
-| Slowest model                                          | 4.13 s                 | **188 ms**          |
-| Rotated unit cube                                      | 1.87 s, 32 hulls       | **11 ms, 1 hull**   |
-| Models decomposed into no hulls at all                 | 3                      | **0**               |
-| Source surface more than 1 cm outside every hull       | 3.4%                   | **1.6%**            |
-| Source surface more than 5 cm outside every hull       | 2.3%                   | **0.9%**            |
-| Mean hulls per model                                   | 30.1                   | **28.1**            |
-| Models using all 32 hulls                              | 550                    | **491**             |
-| Mean hull faces per model                              | 761                    | **728**             |
+|                                                        | Upstream 4.1 | This fork    |
+| ------------------------------------------------------ | -----------: | -----------: |
+| Hulls per model                                        | 30.1         | **14.4**     |
+| Hull faces per model                                   | 789          | **297**      |
+| Models that came out as one hull                       | 10           | **82**       |
+| Models that hit the 32-hull cap                        | 550          | **117**      |
+| Source surface more than 1 cm outside every hull       | 3.37%        | **0.87%**    |
+| Source surface more than 5 cm outside every hull       | 2.24%        | **0.47%**    |
+| Hull surface standing off the source, 95th percentile  | 2.99 m       | **1.70 m**   |
+| Models decomposed into no hulls at all                 | 3            | **0**        |
+| Total decomposition time                               | 203 s        | **37 s**     |
+| Median model                                           | 195 ms       | **44 ms**    |
+| 95th percentile model                                  | 815 ms       | **163 ms**   |
+| Slowest model                                          | 4.26 s       | **349 ms**   |
 
-The median model decomposes 11.9x faster. The fork is slower on only three models: the three that upstream
-reduced to nothing in under 0.1 ms, which the fork now decomposes properly in 0.2 to 2 ms. Keeping tilted solids
-whole leaves a little more hull surface away from the source: the median distance from a hull's surface to the
-source mesh is about 4% larger on average, and the 95th percentile about 1%. With `m_tiltedSurfaceAllowance`
-set to 0, both are within about 1% of upstream's.
+Every model's uncovered surface stays inside the accuracy it was asked for, at the 99th percentile, on all 611.
+The corpus is mostly large environment geometry, which is why those distances are in metres; on 61 props (glTF
+sample assets and game props under 10 m) the same comparison against the fork's own previous, count-driven
+revision is 15.3 hulls per model instead of 26.4, with hull surfaces standing 90 mm off the source at the 95th
+percentile instead of 152 mm.
+
+## How it decides
+
+Three settings describe what the collision has to be, and nothing describes how to get there.
+
+- **A tolerance.** How far a hull may stand off the surface: `clamp(m_relativeTolerance * diagonal,
+  m_minTolerance, m_maxTolerance)`. It also sets the voxel size, so a model is resolved to the accuracy asked of
+  it rather than to a fixed grid, and a large model is no longer coarse for being large.
+- **A probe radius.** Gaps, slots and pockets that a sphere of `m_probeRadius` cannot enter from outside are
+  filled, along with sealed cavities: nothing that size can occupy them, so hulls may cover them, and covering
+  them costs far fewer hulls. Slatted crates, handles, wheel wells and bottle necks stop being concavities.
+- **Budgets.** `m_maxConvexHulls`, `m_maxVoxels` and `m_maxPieces` bound the work rather than the quality.
+  `IVHACD::GetReport` says which of them, if any, decided the result, and what tolerance was really used.
+
+A piece splits while its hull would cover space no hull may cover, and two hulls merge while the merged hull
+would not. What is left when no pair may merge is the hull count.
 
 ## What changed
 
-### Faster
+### Hulls follow the shape
 
-Each change was measured on the same corpus when it landed, and together they account for nearly all of the
-speed-up above. Every change in the table except the tilted-surface allowance leaves all 611 outputs byte for
-byte identical.
+Upstream splits a piece until its hull is within a percentage of its voxel volume, then merges pieces back until
+a count is met. Volume is the wrong measure for collision: a deep narrow hole has little volume and blocks
+everything, while a wide shallow dish has plenty and blocks nothing. A count is the wrong control: on this
+corpus, models under 10 m needed a median of 2 hulls to reach the accuracy their grid could offer and were given
+21.8, while 14 of 159 needed more than the 32 they were allowed.
+
+The fork measures distance instead, on the voxel grid it already builds:
+
+1. The solid is closed by the probe: three exact integer distance transforms (Meijster, Roerdink and Hesselink)
+   give the space the probe can reach from outside, the solid that closing leaves behind, and the distance from
+   it. Every voxel farther than the tolerance from that closed solid is one no hull may cover.
+2. A piece whose hull covers one of those voxels splits. Nothing else makes it split, so a rotated cube, a
+   tilted quad and a single triangle are one hull each; upstream produces 32, 32 and 17.
+3. Pairs of hulls merge, cheapest added volume first, while the merged hull covers none of them.
+
+### Faster than upstream
+
+The speed came first, from work that left every output byte for byte identical, and holds up under the new
+decisions: 203 s to 37 s over the corpus, and no model slower than 349 ms.
 
 | Change | Speed-up |
 | --- | ---: |
 | Build each piece's hull straight from its voxel corners. Upstream built a triangle mesh and an AABB tree for every piece, which only the experimental `m_findBestPlane` search ever read. | 3.55x |
-| Stop splitting convex solids over the voxel staircase (`m_tiltedSurfaceAllowance`), so there are fewer pieces to build and merge. | 1.42x |
 | Keep hull faces in vectors instead of linked lists, and stop allocating a 147 KB node pool for every hull. | 1.24x |
 | Collect voxel corners with a bitmap, already sorted, instead of a hash map. | 1.19x |
 | Sum exact coordinate differences as floating-point expansions before falling back to 256-bit arithmetic. | 1.14x |
@@ -61,25 +94,21 @@ byte identical.
 | Skip voxels already on the surface while voxelizing. | 1.03x |
 | Compute tree statistics with SSE2. | 1.02x |
 
-With `m_tiltedSurfaceAllowance` set to 0, which keeps upstream's volume error test, the fork still decomposes the
-corpus 9.4x faster (20.3 s).
+Merging prices only the pairs that can merge. Hulls farther apart than a filled gap, hulls whose bounds hold
+nothing that may not be covered, and hulls with a forbidden voxel on the line between them are all settled
+without building anything; without those three tests a passenger coach takes 17.4 s instead of 1.2 s.
 
 ### Better hulls
 
-- **Convex solids stay whole.** A hull built from voxel corners always exceeds the voxels of a surface that is not
-  axis-aligned by a staircase of about half a voxel per surface voxel, even on a flat face. Upstream counted that
-  gap as concavity, so every oblique solid split to the recursion limit and merged back up to the hull cap: a
-  rotated cube came out as 32 hulls. The fork discounts the gap on tilted surfaces, so a rotated cube is one hull
-  and 87 models use fewer hulls.
 - **Small parts of large models survive.** Upstream welded every vertex within 0.1% of the model's largest
-  dimension and dropped the triangles that collapsed. On large models that deleted real geometry: 18 cm lamps
-  spread over a 270 m airfield and narrow slivers of 600 m terrain tiles produced no hulls at all. The fork welds
-  only vertices at exactly the same position. The four models that now use more hulls are all ones upstream
-  damaged this way: besides those three, a model of small details spread across 138 m went from 2 hulls, which
-  left 98% of its surface uncovered, to 15.
-- **Vertex caps cost less.** When a hull has more vertices than `m_maxNumVerticesPerCH`, the fork adds the farthest
-  remaining point first instead of taking faces in creation order. With that order, 32-vertex hulls leave less of
-  the source uncovered than 44-vertex hulls did before.
+  dimension and dropped the triangles that collapsed, which deleted real geometry: 18 cm lamps spread over a
+  270 m airfield and narrow slivers of 600 m terrain tiles produced no hulls at all. The fork welds only vertices
+  at exactly the same position.
+- **The voxel staircase is not concavity.** A hull of voxel corners always exceeds the voxels of a surface that is
+  not axis-aligned. Upstream counted that as concavity and split every oblique solid to its recursion limit; the
+  probe's closing swallows those notches, so nothing about them makes a piece split.
+- **Vertex caps cost less.** When a hull has more vertices than `m_maxNumVerticesPerCH`, the fork adds the
+  farthest remaining point first instead of taking faces in creation order.
 
 ### Correct and predictable
 
@@ -88,20 +117,25 @@ corpus 9.4x faster (20.3 s).
   your logger, instead of reading out of bounds.
 - Merge order no longer depends on `std::unordered_map` iteration order. Exactly equal merge costs, which are common
   between voxel-aligned pieces, break ties by hull id, so a model decomposes the same way with any standard library.
+  Repeated runs produce identical output on all 611 corpus models.
+- The space model is integer work throughout: squared distances, and lower envelopes compared by
+  cross-multiplication, so the field is exact and reproduces bit for bit.
 - Latent undefined behavior is fixed: out-of-range pointer arithmetic in the flood fill, a tree of unbounded depth
   walked with a fixed-size stack, a data race on a static counter shared by all instances, and a quicksort whose
   stack was guarded only by an assert.
-- `m_maxRecursionDepth` means what it says, and `ConvexHull::m_center` is the hull's center of mass as a solid.
+- `ConvexHull::m_center` is the hull's center of mass as a solid.
 - A contract test suite (`test/ContractTests.cpp`) covers typed results, validation, cancellation, instance reuse,
-  centroids, hull reduction, and the orientation test against exact integer arithmetic.
+  centroids, hull reduction, what the tolerance, probe radius and budgets promise, the orientation test against
+  exact integer arithmetic, and the space test against its own definition over every voxel of a grid.
 
 ### Built for engines
 
 - `Compute` runs on the calling thread and owns no threads, so it fits into a job system without oversubscribing
   the CPU. Instances share no mutable state; run one per worker.
 - `Cancel()` works from any thread, including from your progress callback, and takes effect promptly: `Compute`
-  reports progress after at most 10 ms of work plus its longest indivisible step, which stays under 30 ms on the
-  benchmark corpus.
+  reports progress after at most 10 ms of work plus its longest indivisible step. Over the benchmark corpus the
+  longest gap between reports is 14 ms for the median model and 16 ms at the 95th percentile; the worst, 152 ms,
+  is the 267,000-triangle warehouse, whose AABB tree is built in one step.
 
 ## Quick start
 
@@ -128,10 +162,15 @@ int main()
         2, 6, 3,  3, 6, 7,  0, 4, 2,  2, 4, 6,  1, 3, 5,  3, 7, 5,
     };
 
+    // Collision may stand off the surface by 1% of the cube's diagonal, and openings a 5 cm sphere
+    // cannot enter may be filled. How many hulls that takes is the library's business.
     VHACD::IVHACD::Parameters params;
+    params.m_relativeTolerance = 0.01;
+    params.m_minTolerance = 0.01;
+    params.m_maxTolerance = 0.03;
+    params.m_probeRadius = 0.05;
     params.m_maxConvexHulls = 32;
-    params.m_resolution = 100000;
-    params.m_maxNumVerticesPerCH = 32;
+    params.m_maxNumVerticesPerCH = 44;
 
     VHACD::IVHACD* const vhacd = VHACD::CreateVHACD();
     const VHACD::IVHACD::ComputeResult result = vhacd->Compute(positions.data(),
@@ -154,7 +193,16 @@ int main()
 ```
 
 `Compute` also accepts `double` positions. Hulls come back as double-precision vertices and triangles in the
-input's coordinate space, with their volume and center of mass.
+input's coordinate space, with their volume and center of mass. `GetReport()` says what the decomposition used:
+
+```cpp
+const VHACD::IVHACD::Report& report = vhacd->GetReport();
+std::printf("tolerance %.1f mm, voxel %.1f mm, %u pieces%s\n",
+            report.m_tolerance * 1000.0,
+            report.m_voxelSize * 1000.0,
+            report.m_pieceCount,
+            report.m_voxelBudgetBound ? " (voxel budget)" : "");
+```
 
 ### Cancellation
 
@@ -186,22 +234,26 @@ Point `params.m_callback` at an instance. You can also call `Cancel()` directly 
 
 ## Parameters
 
+Lengths are in the units of the input, so a mesh in metres takes metres.
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `m_maxConvexHulls` | 64 | Maximum number of hulls, at least 1. Pieces merge, cheapest added volume first, until this many remain. |
-| `m_resolution` | 400000 | Voxel budget. The longest axis gets floor(1.5 × resolution^0.33) voxels, from 32 to 1021: 67 for 100000, 105 for 400000. |
-| `m_minimumVolumePercentErrorAllowed` | 1 | A piece stops splitting once its hull is within this percentage of its voxel volume. |
-| `m_tiltedSurfaceAllowance` | 0.5 | Voxel volumes per tilted surface voxel that do not count as error. 0 keeps upstream's test. |
-| `m_maxRecursionDepth` | 10 | Pieces at this split depth are not split again (the whole model is depth 0), so at most 2^depth pieces precede merging. |
-| `m_minEdgeLength` | 2 | A piece spanning at most this many voxels on every axis is not split again. |
-| `m_maxNumVerticesPerCH` | 64 | Maximum vertices per hull, at least 4. Larger hulls keep their farthest points first. |
+| `m_relativeTolerance` | 0.01 | How far a hull may stand off the surface, as a fraction of the model's bounding-box diagonal. |
+| `m_minTolerance` | 0.01 | Floor on that tolerance. |
+| `m_maxTolerance` | 0.03 | Ceiling on it, so large models do not demand grids they cannot afford. |
+| `m_probeRadius` | 0.05 | Gaps, openings and pockets a sphere of this radius cannot enter from outside are filled, as are sealed cavities. 0 keeps every reachable pocket. |
+| `m_maxVoxels` | 524288 | Voxel budget. Where it binds, the voxel size and the tolerance are coarsened together and the report says so. |
+| `m_maxConvexHulls` | 64 | Hull budget. Hulls merge past the tolerance only to meet it, which the report records. |
+| `m_maxPieces` | 512 | Piece budget: splitting stops here even where a piece still reaches too far. |
+| `m_maxNumVerticesPerCH` | 32 | Maximum vertices per hull, at least 4. Larger hulls keep their farthest points first. |
 | `m_shrinkWrap` | true | Moves hull vertices within one voxel of the source mesh onto it. |
 | `m_fillMode` | `FLOOD_FILL` | How the interior is found: `FLOOD_FILL` for closed meshes, `RAYCAST_FILL` for meshes with holes, `SURFACE_ONLY` for hollow results. |
 | `m_callback` | null | Receives progress on the thread running `Compute`. |
 | `m_logger` | null | Receives warnings and the reason for `InvalidInput`. |
 
-The benchmark settings (32 hulls, 32 vertices, resolution 100000) suit game collision well. Raise the resolution
-for more detail, and lower `m_maxConvexHulls` for cheaper collision.
+The tolerance is the dial worth turning. A finer one costs voxels, and where the voxel budget cannot follow, the
+report's `m_tolerance` tells you what you actually got. The probe radius is the second: it is the size of the
+smallest thing that has to fit into an object's openings, and raising it is the cheapest way to fewer hulls.
 
 ## Requirements and building
 
@@ -226,18 +278,19 @@ ctest --test-dir build/test -C Release
 directory. `app/meshes` has sample meshes to try.
 
 ```sh
-TestVHACD app/meshes/bunny.obj -h 32 -v 32 -r 100000 -o obj
+TestVHACD app/meshes/bunny.obj -e 0.01 -t 0.05 -h 32 -v 44 -o obj
 ```
 
 | Option | Meaning (default) |
 | --- | --- |
-| `-h <n>` | Maximum number of hulls (64) |
-| `-r <n>` | Voxel budget (400000) |
-| `-e <percent>` | Volume error allowed, 0.001 to 10 (1) |
-| `-t <voxels>` | Tilted surface allowance (0.5) |
-| `-d <n>` | Recursion depth (10) |
-| `-v <n>` | Maximum vertices per hull (64) |
-| `-l <n>` | Minimum edge length in voxels (2) |
+| `-e <fraction>` | Tolerance as a fraction of the model's diagonal (0.01) |
+| `-n <length>` | Smallest tolerance, in model units (0.01) |
+| `-x <length>` | Largest tolerance, in model units (0.03) |
+| `-t <radius>` | Probe radius: gaps this sphere cannot enter are filled (0.05) |
+| `-h <n>` | Hull budget (64) |
+| `-r <n>` | Voxel budget (524288) |
+| `-d <n>` | Piece budget (512) |
+| `-v <n>` | Maximum vertices per hull (32) |
 | `-s true/false` | Shrink wrap (true) |
 | `-f flood/raycast/surface` | Fill mode (flood) |
 | `-o obj/stl/usda` | Also write one OBJ or STL file per hull, or a single `decomp.usda` |
@@ -250,45 +303,64 @@ TestVHACD app/meshes/bunny.obj -h 32 -v 32 -r 100000 -o obj
   `IUserTaskRunner`, `m_taskRunner` and `m_asyncACD`. Call `Compute` from your own worker thread.
 - Also removed: `m_findBestPlane` (experimental and off by default), `ComputeCenterOfMass` (it always returned
   false) and `findNearestConvexHull`.
-- Upstream's `m_maxRecursionDepth` split one level deeper than documented. Pass N + 1 to get upstream's depth N.
+- The hull count is an outcome, not an input. `m_resolution`, `m_minimumVolumePercentErrorAllowed`,
+  `m_maxRecursionDepth` and `m_minEdgeLength` are gone; `m_relativeTolerance`, `m_minTolerance`, `m_maxTolerance`,
+  `m_probeRadius`, `m_maxVoxels` and `m_maxPieces` replace them. `m_maxConvexHulls` stays, as a budget.
+- Tolerances are lengths in the units of your mesh. A mesh normalized to a unit cube wants a tolerance around
+  0.01; a mesh in metres wants metres.
+- `IVHACD::GetReport()` is new, and worth logging: it reports the tolerance and voxel size used and which budget,
+  if any, decided the result.
 - `ConvexHull::m_center` is the center of mass of the hull as a solid. Upstream returned the area centroid of its
   surface.
-- `m_tiltedSurfaceAllowance` is new. Set it to 0 to keep upstream's volume error test.
 - Only exactly coincident vertices are welded.
-- `TestVHACD` lost `-a` (asynchronous) and `-p` (best plane) and gained `-t`.
+- `TestVHACD` lost `-a` (asynchronous), `-p` (best plane) and `-l`, and its `-e`, `-r`, `-d` and `-t` now mean
+  tolerance, voxel budget, piece budget and probe radius.
 - The library needs C++17 and SSE2.
 
 ## Limitations
 
-- Flat geometry without thickness still splits into many hulls: a single triangle becomes 17 hulls and a tilted
-  quad uses all 32, because the hull of a one-voxel-thick slab rarely gets within the volume error.
-- Complex models use every hull `m_maxConvexHulls` allows; the count does not adapt to a target accuracy.
-- Detail smaller than a voxel is approximated at voxel scale.
+- A model far larger than its tolerance hits the voxel budget, and then the grid decides the accuracy rather than
+  the tolerance. The report says when that happened; raising `m_maxVoxels` costs cook time roughly in proportion.
+- Detail smaller than a voxel is approximated at voxel scale, and a feature far below the tolerance is covered
+  rather than resolved.
+- A probe pressed against the mouth of a narrow channel reaches into it, so a channel open at its ends keeps a
+  thin reachable region near each opening even when the probe cannot travel down it.
+- The interior still comes from a flood fill, so a mesh with a hole large enough to leak is treated as the shell
+  it looks like. Generalized winding numbers would settle that, and would replace the fill modes.
+- Merging is greedy, so a decomposition is not the smallest set of hulls that meets the tolerance, only a small
+  one reached cheaply.
 
 ## Benchmark details
 
 - **Corpus**: 611 inputs. 606 are glTF models from a game project: buildings and city blocks, terrain tiles up to
   several hundred meters across, props and vehicles. 5 are synthetic: a triangle, a quad, a tilted quad, a unit
   cube and a rotated unit cube.
-- **Settings**: 32 hulls, resolution 100000, 32 vertices per hull, 1% volume error, minimum edge length 2, shrink
-  wrap on, flood fill. Recursion depth 8 for upstream and 9 for the fork, which split the same way. Upstream ran with
-  `m_asyncACD` off, so both use one thread.
+- **Settings**: upstream at its own, 32 hulls and resolution 100000 with recursion depth 8, 1% volume error and
+  minimum edge length 2; the fork at its defaults, 1% of the diagonal clamped to 1 to 3 cm with a 5 cm probe and
+  half a million voxels. Both with a 32-hull budget, 44 vertices per hull, shrink wrap on, flood fill, and
+  upstream's `m_asyncACD` off, so both use one thread.
 - **Machine**: AMD Ryzen 7 9800X3D, Windows 11, MSVC 14.51 toolset (Visual Studio 2026), x64, `/O2 /GL /fp:precise`.
-- **Timing**: wall time of `Compute` for each model, the minimum over two alternating runs for upstream and three
-  for the fork. Repeated runs produced identical output for both.
+- **Timing**: wall time of `Compute` for each model, one run each; repeated runs produced identical output on
+  every model.
 - **Coverage**: 20,000 area-weighted samples on each model's surface. A sample counts as uncovered if it lies more
   than 1 cm or 5 cm outside the nearest hull, measured to that hull's face planes. The table shows the mean over
-  all models; a model with no hulls counts as fully uncovered.
+  all models; a model with no hulls counts as fully uncovered. "Inside the accuracy it was asked for" compares
+  each model's 99th-percentile uncovered distance against the tolerance its own report records.
+- **Standing off**: 20,000 area-weighted samples on the hull surfaces, excluding samples buried inside another
+  hull, measured to the nearest source triangle. The table shows the mean of each model's 95th percentile.
 
 ## How it works
 
-1. **Voxelize.** The mesh is normalized and voxelized, and the interior is filled by flood fill, by ray casts, or
-   not at all.
-2. **Split.** Each piece's convex hull is built from the corners of its surface voxels. A piece whose hull exceeds
-   its voxels by more than the allowed error splits at the middle of its longest axis, down to the recursion
-   depth.
-3. **Merge.** Pairs of hulls merge, the pair adding the least volume first, until at most `m_maxConvexHulls` remain.
-4. **Finish.** Hull vertices near the source mesh move onto it, and each hull is reduced to at most
+1. **Voxelize.** The mesh is normalized and voxelized on a grid whose voxel is a fraction of the tolerance, and
+   the interior is filled by flood fill, by ray casts, or not at all.
+2. **Close.** Distance transforms give the space the probe sphere reaches from outside, and what it cannot reach
+   is added to the solid. Every voxel farther than the tolerance from that closed solid is marked as one no hull
+   may cover.
+3. **Split.** Each piece's convex hull is built from the corners of its surface voxels. A piece whose hull covers
+   a marked voxel splits at the middle of its longest axis.
+4. **Merge.** Pairs of hulls merge, the pair adding the least volume first, while the merged hull covers no marked
+   voxel. What remains when no pair may merge is the result; `m_maxConvexHulls` bounds it.
+5. **Finish.** Hull vertices near the source mesh move onto it, and each hull is reduced to at most
    `m_maxNumVerticesPerCH` vertices.
 
 A single convex hull fills every concavity, and an exact convex decomposition produces far more parts than a
@@ -305,6 +377,12 @@ simulation can afford. An approximate decomposition sits in between:
 - **Julio Jerez**, author of the Newton physics engine, wrote the convex hull builder.
 - The exact orientation test uses floating-point expansion arithmetic from **Jonathan Richard Shewchuk**'s
   *Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates*.
+- The distance fields follow **Meijster, Roerdink and Hesselink**, *A general algorithm for computing distance
+  transforms in linear time* (2000), which keeps them exact and reproducible in integers.
+- Measuring concavity as a distance rather than a volume follows **Wei et al.**, *Approximate Convex Decomposition
+  for 3D Meshes with Collision-Aware Concavity and Tree Search* (SIGGRAPH 2022), and leaving space that nothing
+  can reach to the hulls follows **James Andrews**, *Navigation-Driven Approximate Convex Decomposition*
+  (SIGGRAPH 2024).
 
 ## License
 

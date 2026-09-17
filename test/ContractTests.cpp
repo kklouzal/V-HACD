@@ -325,8 +325,16 @@ void HullSpaceTestMatchesBruteForce()
         }
     }
 
+    // The library polls for cancellation between passes; nothing here ever cancels.
+    struct NeverCancels final : VHACD::VHACDCallbacks
+    {
+        void ProgressUpdate(VHACD::Stages, double, const char*) override {}
+        bool PollProgress(VHACD::Stages, double, const char*) override { return false; }
+        bool IsCanceled() const override { return false; }
+    } callbacks;
+
     VHACD::SpaceModel space;
-    space.Build(volume, 1.5, 3.0);
+    space.Build(volume, 1.5, 3.0, callbacks);
     CHECK(space.GetFarVoxelCount() > 0);
 
     std::mt19937_64 rng(0x5eed);
