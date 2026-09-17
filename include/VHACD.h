@@ -808,6 +808,10 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 #include <vector>
 
 #ifdef _MSC_VER
+#include <intrin.h>
+#endif // _MSC_VER
+
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable:4100 4127 4189 4244 4456 4701 4702 4996)
 #endif // _MSC_VER
@@ -822,6 +826,23 @@ IVHACD* CreateVHACD();      // Create a V-HACD instance; Compute runs synchronou
 // #pragma GCC diagnostic warning "-Wnon-virtual-dtor"
 // #pragma GCC diagnostic warning "-Wshadow"
 #endif // __GNUC__
+
+namespace VHACD {
+
+// Index of the lowest set bit; bits must be non-zero.
+inline unsigned CountTrailingZeros(const uint64_t bits)
+{
+    assert(bits != 0);
+#ifdef _MSC_VER
+    unsigned long index;
+    _BitScanForward64(&index, bits);
+    return unsigned(index);
+#else
+    return unsigned(__builtin_ctzll(bits));
+#endif
+}
+
+} // namespace VHACD
 
 // Scoped Timer
 namespace VHACD {
@@ -1875,7 +1896,11 @@ void ConvexHull::GetUniquePoints(std::vector<ConvexHullVertex>& points)
     const auto samePosition = [](const ConvexHullVertex& a, const ConvexHullVertex& b) {
         return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
     };
-    std::sort(points.begin(), points.end(), lexicographicLess);
+    // Voxel corners arrive sorted and distinct.
+    if (!std::is_sorted(points.begin(), points.end(), lexicographicLess))
+    {
+        std::sort(points.begin(), points.end(), lexicographicLess);
+    }
     points.erase(std::unique(points.begin(), points.end(), samePosition), points.end());
 }
 
@@ -3640,9 +3665,8 @@ inline size_t VoxelDimensionForResolution(const size_t resolution)
     return std::max(dim, size_t(32));
 }
 
-// Voxel coordinates and the voxel corner coordinates hulls are built from are packed into 10 bits
-// each (Voxel, VoxelHull::GetVertexIndex). A corner coordinate reaches the axis voxel count, which is
-// at most the longest-axis count plus two, so that count must stay below 1022.
+// Voxel packs voxel coordinates into 10 bits each. A coordinate on a shorter axis reaches the
+// longest-axis count plus one, so that count must stay below 1023.
 constexpr size_t MaxVoxelDimension = 1021;
 
 void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
@@ -4277,20 +4301,10 @@ public:
                                  const double scale,
                                  const VHACD::Vect3& bmin) const;
 
-    // Sees if we have already got an index for this voxel position.
-    // If the voxel position has already been indexed, we just return
-    // that index value.
-    // If not, then we convert it into the floating point position and
-    // add it to the index map
-    uint32_t GetVertexIndex(const VHACD::Vector3<uint32_t>& p);
-
-    // Gathers the corners of every surface voxel (original and split-plane) as hull input points.
-    // Corners, not voxel centers, are required: a hull of the centers would not enclose the voxels.
-    // Interior voxels cannot contribute hull vertices and are skipped.
+    // Gathers the distinct corners of every surface voxel (original and split-plane) as hull input points,
+    // in lexicographic order of position. Corners, not voxel centers, are required: a hull of the centers
+    // would not enclose the voxels. Interior voxels cannot contribute hull vertices and are skipped.
     void CollectHullPoints();
-
-    // Indexes the 8 corners of a single voxel
-    void AddVoxelCorners(const Voxel &v);
 
     // Splits at the midpoint of the longest side of the voxel region
     SplitAxis ComputeSplitPlane(uint32_t& location);
@@ -4322,7 +4336,7 @@ public:
     // of the entire source
     VHACD::Vector3<uint32_t>                    m_1{ 0 };
     VHACD::Vector3<uint32_t>                    m_2{ 0 };
-    std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
+
     std::vector<VHACD::Vertex>                  m_vertices;
     IVHACD::Parameters                          m_params;
 };
@@ -4571,54 +4585,75 @@ VHACD::Vect3 VoxelHull::GetPoint(const int32_t x,
                         z * scale + bmin.GetZ());
 }
 
-uint32_t VoxelHull::GetVertexIndex(const VHACD::Vector3<uint32_t>& p)
-{
-    uint32_t ret = 0;
-    uint32_t address = (p.GetX() << 20) | (p.GetY() << 10) | p.GetZ();
-    auto found = m_voxelIndexMap.find(address);
-    if ( found != m_voxelIndexMap.end() )
-    {
-        ret = found->second;
-    }
-    else
-    {
-        VHACD::Vect3 vertex = GetPoint(p.GetX(),
-                                       p.GetY(),
-                                       p.GetZ(),
-                                       m_voxelScale,
-                                       m_voxelAdjust);
-        ret = uint32_t(m_voxelIndexMap.size());
-        m_voxelIndexMap[address] = ret;
-        m_vertices.emplace_back(vertex);
-    }
-    return ret;
-}
-
 void VoxelHull::CollectHullPoints()
 {
-    for (const Voxel& v : m_surfaceVoxels)
+    if ( m_surfaceVoxels.empty() && m_newSurfaceVoxels.empty() )
     {
-        AddVoxelCorners(v);
+        return;
     }
-    for (const Voxel& v : m_newSurfaceVoxels)
-    {
-        AddVoxelCorners(v);
-    }
-}
 
-void VoxelHull::AddVoxelCorners(const Voxel &v)
-{
-    const uint32_t x = v.GetX();
-    const uint32_t y = v.GetY();
-    const uint32_t z = v.GetZ();
-    for (uint32_t dz = 0; dz < 2; ++dz)
+    // Voxel (x, y, z) has the corners x..x+1, y..y+1 and z..z+1.
+    uint32_t x0 = UINT32_MAX;
+    uint32_t y0 = UINT32_MAX;
+    uint32_t z0 = UINT32_MAX;
+    uint32_t x1 = 0;
+    uint32_t y1 = 0;
+    uint32_t z1 = 0;
+    for (const std::vector<Voxel>* voxels : { &m_surfaceVoxels, &m_newSurfaceVoxels })
     {
-        for (uint32_t dy = 0; dy < 2; ++dy)
+        for (const Voxel& v : *voxels)
         {
-            for (uint32_t dx = 0; dx < 2; ++dx)
+            x0 = std::min(x0, v.GetX());
+            y0 = std::min(y0, v.GetY());
+            z0 = std::min(z0, v.GetZ());
+            x1 = std::max(x1, v.GetX());
+            y1 = std::max(y1, v.GetY());
+            z1 = std::max(z1, v.GetZ());
+        }
+    }
+    const size_t wy = size_t(y1 - y0) + 2;
+    const size_t wz = size_t(z1 - z0) + 2;
+    const size_t cornerCount = (size_t(x1 - x0) + 2) * wy * wz;
+
+    // One bit per corner at ((x - x0) * wy + (y - y0)) * wz + (z - z0), so ascending bit order is lexicographic
+    // (x, y, z) order, which GetPoint turns into lexicographic order of position. Pieces at one split depth
+    // have disjoint voxel boxes, so together their bitmaps hold little more than one grid of corners.
+    std::vector<uint64_t> corners((cornerCount + 63) / 64);
+    const size_t planeStep = wy * wz;
+    for (const std::vector<Voxel>* voxels : { &m_surfaceVoxels, &m_newSurfaceVoxels })
+    {
+        for (const Voxel& v : *voxels)
+        {
+            const size_t base = (size_t(v.GetX() - x0) * wy + size_t(v.GetY() - y0)) * wz + size_t(v.GetZ() - z0);
+            for (const size_t offset : { size_t(0), size_t(1), wz, wz + 1, planeStep, planeStep + 1, planeStep + wz, planeStep + wz + 1 })
             {
-                GetVertexIndex(VHACD::Vector3<uint32_t>(x + dx, y + dy, z + dz));
+                const size_t bit = base + offset;
+                corners[bit >> 6] |= uint64_t(1) << (bit & 63);
             }
+        }
+    }
+
+    // The row (x, y) holds the bits [rowStart, rowStart + wz).
+    size_t x = 0;
+    size_t y = 0;
+    size_t rowStart = 0;
+    for (size_t word = 0; word < corners.size(); ++word)
+    {
+        for (uint64_t bits = corners[word]; bits != 0; bits &= bits - 1)
+        {
+            const size_t bit = word * 64 + CountTrailingZeros(bits);
+            if ( bit >= rowStart + wz )
+            {
+                const size_t row = bit / wz;
+                x = row / wy;
+                y = row - x * wy;
+                rowStart = row * wz;
+            }
+            m_vertices.emplace_back(GetPoint(int32_t(x0 + x),
+                                             int32_t(y0 + y),
+                                             int32_t(z0 + (bit - rowStart)),
+                                             m_voxelScale,
+                                             m_voxelAdjust));
         }
     }
 }
